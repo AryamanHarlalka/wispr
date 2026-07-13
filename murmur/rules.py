@@ -23,9 +23,11 @@ SPOKEN_PUNCT = [
     (re.compile(r"\bexclamation (mark|point)\b", re.I), "!"),
 ]
 
-# "2 actually 3" / "tuesday, no wait, wednesday" — keep the correction
+# "2 actually 3" / "tuesday, no wait, wednesday" — keep the correction.
+# Group 1 is a SINGLE token: replacing more risks eating words
+# ("we need two, actually three" must become "we need three").
 BACKTRACK = re.compile(
-    r"([\w'@.-]+(?:\s[\w'@.-]+)?)[,]?\s+"
+    r"([\w'@.-]+)[,]?\s+"
     r"(?:actually|no wait|no,|i mean|scratch that|sorry)[,]?\s+"
     r"([\w'@.-]+)",
     re.IGNORECASE,
