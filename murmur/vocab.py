@@ -76,6 +76,14 @@ def write_vocab(vault: Path = VAULT) -> Path:
 
 
 def initial_prompt(vocab: list[str], corrections: dict[str, str]) -> str:
-    """Whisper bias prompt: a natural-ish sentence listing the terms."""
-    names = ", ".join(list(dict.fromkeys(vocab + list(corrections.values())))[:120])
-    return f"Notes mentioning {names}."
+    """Whisper bias prompt: a natural-ish sentence listing the terms.
+
+    Kept deliberately small (B2): Whisper's prompt window is 224 tokens —
+    beyond ~60 multi-token names the tail is truncated anyway, and every
+    prompt token is re-encoded as decoder prefix on every dictation (and on
+    every chunk once incremental decoding is on). Corrections' right-hand
+    sides go first: they're terms the user explicitly flagged as misheard,
+    so they're the highest-value bias targets.
+    """
+    terms = list(dict.fromkeys(list(corrections.values()) + vocab))[:60]
+    return f"Notes mentioning {', '.join(terms)}."

@@ -16,12 +16,15 @@ import numpy as np
 
 from . import cleanup, history, modes as modes_mod, vocab as vocab_mod
 from .config import (MURMUR_HOME, ensure_home, load_corrections, load_modes,
-                     load_snippets, load_vocab)
+                     load_snippets, load_vocab, whisper_model)
 from .indicator import Indicator
 
 SAMPLE_RATE = 16000
 DOUBLE_TAP_S = 0.4
-MODEL_NAME = "small.en"
+# small.en unless overridden — see config.whisper_model() (B2). distil-small.en
+# is wired as an opt-in knob; left off by default since we can't cheaply
+# verify it doesn't regress accuracy on the vault vocab in this session.
+MODEL_NAME = whisper_model()
 
 
 class Recorder:
@@ -53,6 +56,49 @@ class Recorder:
         return np.concatenate(self._frames).flatten()
 
 
+def _pasteboard_read() -> str | None:
+    """Current pasteboard text (None if empty/non-text) via NSPasteboard —
+    no pbpaste subprocess (B2). Text-only, same coverage pbpaste had."""
+    from AppKit import NSPasteboard, NSPasteboardTypeString
+    return NSPasteboard.generalPasteboard().stringForType_(NSPasteboardTypeString)
+
+
+def _pasteboard_write(text: str) -> None:
+    from AppKit import NSPasteboard, NSPasteboardTypeString
+    pb = NSPasteboard.generalPasteboard()
+    pb.clearContents()
+    pb.setString_forType_(text, NSPasteboardTypeString)
+
+
+def _send_cmd_v() -> None:
+    """Synthetic Cmd-V via Quartz CGEventPost (B2) — replaces the ~150 ms
+    osascript round-trip. Quartz is already installed as a pynput dep.
+    Falls back to osascript if Quartz is unavailable, keeping the old
+    error reporting (osascript stderr surfaces missing Accessibility)."""
+    try:
+        import Quartz
+        kVK_ANSI_V = 9
+        src = Quartz.CGEventSourceCreate(Quartz.kCGEventSourceStateHIDSystemState)
+        down = Quartz.CGEventCreateKeyboardEvent(src, kVK_ANSI_V, True)
+        up = Quartz.CGEventCreateKeyboardEvent(src, kVK_ANSI_V, False)
+        Quartz.CGEventSetFlags(down, Quartz.kCGEventFlagMaskCommand)
+        Quartz.CGEventSetFlags(up, Quartz.kCGEventFlagMaskCommand)
+        Quartz.CGEventPost(Quartz.kCGHIDEventTap, down)
+        Quartz.CGEventPost(Quartz.kCGHIDEventTap, up)
+        return
+    except Exception:
+        pass
+    r = subprocess.run(
+        ["osascript", "-e",
+         'tell application "System Events" to keystroke "v" using command down'],
+        capture_output=True, text=True,
+    )
+    if r.returncode != 0:
+        raise RuntimeError(
+            f"paste failed (grant Accessibility to Terminal/python in "
+            f"System Settings > Privacy & Security): {r.stderr.strip()[:120]}")
+
+
 def paste_text(text: str, target_app=None) -> None:
     """Copy -> reactivate original target app -> Cmd-V -> restore prior
     clipboard (table stakes, spec §1).
@@ -64,31 +110,48 @@ def paste_text(text: str, target_app=None) -> None:
     dictating into — every history.jsonl entry logged "org.python.python".
     Explicitly re-activating the captured app right before sending Cmd-V is
     what actually fixes where the paste lands, regardless of what stole
-    focus in between.
+    focus in between. That capture-and-reactivate sequence MUST stay ahead
+    of the keystroke — do not reorder.
+
+    B2: fixed sleeps replaced by polling frontmost — with the accessory-app
+    policy the target usually never lost focus, so the wait is ~0 instead of
+    a hardcoded 230 ms; when focus did move we wait only as long as the
+    activation actually takes (cap 300 ms).
+
+    B5: the prior clipboard is restored only after a successful keystroke.
+    If anything here raises, the cleaned text is already ON the clipboard,
+    so a manual Cmd-V recovers the dictation.
     """
-    prior = subprocess.run(["pbpaste"], capture_output=True).stdout
-    subprocess.run(["pbcopy"], input=text.encode())
+    prior = _pasteboard_read()
+    _pasteboard_write(text)
     if target_app is not None:
         try:
-            from AppKit import NSApplicationActivateIgnoringOtherApps
+            from AppKit import (NSApplicationActivateIgnoringOtherApps,
+                                NSWorkspace)
             target_app.activateWithOptions_(NSApplicationActivateIgnoringOtherApps)
-            time.sleep(0.15)  # give it a beat to actually come forward
+            ws = NSWorkspace.sharedWorkspace()
+            deadline = time.time() + 0.3
+            while time.time() < deadline:
+                front = ws.frontmostApplication()
+                if front is not None and \
+                        front.processIdentifier() == target_app.processIdentifier():
+                    break
+                time.sleep(0.02)
+            else:
+                time.sleep(0.05)  # never confirmed; small settle beat
         except Exception:
             pass
-    time.sleep(0.08)
-    r = subprocess.run(
-        ["osascript", "-e",
-         'tell application "System Events" to keystroke "v" using command down'],
-        capture_output=True, text=True,
-    )
-    if r.returncode != 0:
-        raise RuntimeError(
-            f"paste failed (grant Accessibility to Terminal/python in "
-            f"System Settings > Privacy & Security): {r.stderr.strip()[:120]}")
+    _send_cmd_v()
+
+    if prior is None:
+        return  # nothing to restore (empty or non-text clipboard)
 
     def restore() -> None:
-        time.sleep(0.6)
-        subprocess.run(["pbcopy"], input=prior)
+        time.sleep(0.6)  # let the target app consume the paste first
+        try:
+            _pasteboard_write(prior)
+        except Exception:
+            pass
 
     threading.Thread(target=restore, daemon=True).start()
 

@@ -111,6 +111,30 @@ def load_vocab() -> list[str]:
     return [w.strip() for w in p.read_text().splitlines() if w.strip()]
 
 
+DEFAULT_WHISPER_MODEL = "small.en"
+
+
+def whisper_model() -> str:
+    """Whisper model knob (B2). Priority: MURMUR_WHISPER_MODEL env ->
+    ~/.murmur/whisper-model (first line) -> small.en.
+
+    distil-small.en is the candidate faster model; it stays opt-in until
+    its accuracy on the vault vocab is verified with real dictations.
+    """
+    env = os.environ.get("MURMUR_WHISPER_MODEL", "").strip()
+    if env:
+        return env
+    p = MURMUR_HOME / "whisper-model"
+    try:
+        if p.exists():
+            name = p.read_text().strip().splitlines()[0].strip()
+            if name:
+                return name
+    except OSError:
+        pass
+    return DEFAULT_WHISPER_MODEL
+
+
 def anthropic_key() -> str | None:
     """Env first, then macOS keychain item 'murmur-anthropic'."""
     key = os.environ.get("ANTHROPIC_API_KEY")
