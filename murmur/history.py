@@ -8,13 +8,18 @@ from .config import MURMUR_HOME, ensure_home
 
 
 def append(app: str, mode: str, raw: str, cleaned: str, path: str,
-           latency_ms: int) -> None:
+           latency_ms: int, stages: dict | None = None) -> None:
+    """`stages` is optional per-stage latency, e.g.
+    {"whisper_ms": 840, "cleanup_ms": 310, "paste_ms": 260} — total_ms is
+    latency_ms. Old records without it stay readable."""
     ensure_home()
     rec = {
         "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "app": app, "mode": mode, "raw": raw, "cleaned": cleaned,
         "path": path, "latency_ms": latency_ms,
     }
+    if stages:
+        rec["stages"] = {k: int(v) for k, v in stages.items()}
     with open(MURMUR_HOME / "history.jsonl", "a") as f:
         f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 

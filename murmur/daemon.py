@@ -169,6 +169,7 @@ class Daemon:
                 vad_filter=True,
             )
             raw = " ".join(s.text.strip() for s in segments).strip()
+            t_whisper = time.time()
             if not raw:
                 self.indicator.set("error", "heard nothing")
                 time.sleep(1.2)
@@ -177,10 +178,16 @@ class Daemon:
             self.indicator.set("cleaning")
             cleaned, path = cleanup.clean_text(
                 raw, mode, self.vocab, self.corrections, self.snippets)
+            t_clean = time.time()
             paste_text(cleaned, target_app)
-            ms = int((time.time() - t0) * 1000)
+            t_paste = time.time()
+            ms = int((t_paste - t0) * 1000)
             self.indicator.set("pasted", f"{len(cleaned.split())}w · {ms}ms")
-            history.append(bundle, mode, raw, cleaned, path, ms)
+            history.append(bundle, mode, raw, cleaned, path, ms, stages={
+                "whisper_ms": (t_whisper - t0) * 1000,
+                "cleanup_ms": (t_clean - t_whisper) * 1000,
+                "paste_ms": (t_paste - t_clean) * 1000,
+            })
         except Exception as e:  # error state preserves transcript in history
             self.indicator.set("error", str(e)[:60])
             try:
