@@ -340,6 +340,15 @@ class Daemon:
         self._incremental = IncrementalTranscriber(
             self.model, self._model_lock, self.vocab, self.corrections)
         self._incremental.start(self.recorder)
+        # B4: feed Recorder.level to the pill's waveform while listening —
+        # a small standalone thread (like the incremental worker above),
+        # not a restructuring of the existing hotkey/_process threading.
+        threading.Thread(target=self._level_feed, daemon=True).start()
+
+    def _level_feed(self) -> None:
+        while self.recording:
+            self.indicator.push_level(self.recorder.level)
+            time.sleep(0.05)
 
     def _stop_and_process(self) -> None:
         with self._lock:
