@@ -1,10 +1,12 @@
 """Murmur v3 daemon — hold Right Option anywhere, speak, get cleaned text
 pasted at the cursor. Double-tap Right Option toggles hands-free mode.
 
-Pipeline: record (sounddevice) -> transcribe (faster-whisper small.en,
-vault-vocab initial_prompt) -> clean (snippets -> rules -> Haiku w/ 1200 ms
-budget -> rules fallback) -> paste (clipboard-preserving) -> history.
-Audio never leaves the Mac; only cleaned *text* may go to the API (F1).
+Pipeline: record (sounddevice, chunk-decoded incrementally in the
+background — see IncrementalTranscriber, B3) -> transcribe tail only
+(faster-whisper, vault-vocab initial_prompt) -> clean (snippets -> rules ->
+Haiku w/ 1200 ms budget -> rules fallback) -> paste (clipboard-preserving)
+-> history. Audio never leaves the Mac; only cleaned *text* may go to the
+API (F1).
 """
 from __future__ import annotations
 
@@ -54,6 +56,17 @@ class Recorder:
         if not self._frames:
             return np.zeros(0, dtype="float32")
         return np.concatenate(self._frames).flatten()
+
+    def snapshot(self) -> np.ndarray:
+        """Everything recorded so far, without stopping the stream (B3) —
+        lets the incremental decoder peek at in-progress audio. Safe to call
+        from another thread: the sounddevice callback only appends new
+        arrays to `_frames`, never mutates existing ones, so `list(...)`
+        here can't observe a torn read under the GIL."""
+        frames = list(self._frames)
+        if not frames:
+            return np.zeros(0, dtype="float32")
+        return np.concatenate(frames).flatten()
 
 
 def _pasteboard_read() -> str | None:
@@ -156,6 +169,113 @@ def paste_text(text: str, target_app=None) -> None:
     threading.Thread(target=restore, daemon=True).start()
 
 
+CHUNK_INTERVAL_S = 3.0   # how often the background worker checks for new audio
+MIN_CHUNK_AUDIO_S = 4.0  # don't bother decoding a chunk shorter than this
+TRAILING_GUARD_S = 0.6   # don't commit a VAD segment that ends this close to
+                         # "now" — it may still be mid-utterance
+
+
+class IncrementalTranscriber:
+    """B3 — decode committed audio in the background while the user is
+    still talking, so on key-release only the trailing tail needs
+    decoding. This is the riskiest piece of the v3 latency work, so it is
+    built to fail safe: every decode call is wrapped, and any error just
+    means `finalize()` returns None — the caller (Daemon._process) then
+    falls back to the exact whole-utterance decode path that shipped
+    before this feature. A dictation can never be lost to a bug here.
+
+    Runs on its own background thread, started at Daemon._start() and
+    joined inside finalize(). It never touches the Indicator/Tk mainloop
+    and doesn't change how Daemon's own hotkey-listener thread or the
+    per-dictation _process thread are structured — it's an independent
+    worker that Daemon._process consults once, at the very start.
+
+    `model_lock` is shared with Daemon._process's own transcribe() calls
+    so at most one decode ever runs against the shared WhisperModel
+    instance at a time — faster-whisper/ctranslate2 concurrent-call safety
+    isn't documented, so this sidesteps the question entirely rather than
+    relying on it.
+    """
+
+    def __init__(self, model, model_lock: threading.Lock,
+                 vocab: list[str], corrections: dict[str, str]) -> None:
+        self._model = model
+        self._model_lock = model_lock
+        self._vocab = vocab
+        self._corrections = corrections
+        self._stop_evt = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._committed_text = ""
+        self._committed_samples = 0
+        self._failed = False
+
+    def start(self, recorder: "Recorder") -> None:
+        self._thread = threading.Thread(
+            target=self._run, args=(recorder,), daemon=True)
+        self._thread.start()
+
+    def _run(self, recorder: "Recorder") -> None:
+        while not self._stop_evt.wait(CHUNK_INTERVAL_S):
+            try:
+                self._maybe_commit_chunk(recorder)
+            except Exception:
+                # Defensive: stop trying: finalize() will see _failed and
+                # tell the caller to fall back to a plain whole-decode.
+                self._failed = True
+                return
+
+    def _decode(self, audio: np.ndarray, extra_prompt: str) -> list:
+        prompt = vocab_mod.initial_prompt(self._vocab, self._corrections)
+        if extra_prompt:
+            prompt = f"{extra_prompt[-400:]} {prompt}"
+        with self._model_lock:
+            segments, _ = self._model.transcribe(
+                audio, language="en", beam_size=1,
+                initial_prompt=prompt, vad_filter=True)
+        return list(segments)
+
+    def _maybe_commit_chunk(self, recorder: "Recorder") -> None:
+        audio = recorder.snapshot()
+        new_len_s = (len(audio) - self._committed_samples) / SAMPLE_RATE
+        if new_len_s < MIN_CHUNK_AUDIO_S:
+            return
+        chunk = audio[self._committed_samples:]
+        segments = self._decode(chunk, self._committed_text)
+        if not segments:
+            return
+        # Only commit segments that aren't right at the edge of "now" —
+        # they may still be mid-utterance and get revised/continued.
+        safe_end_s = new_len_s - TRAILING_GUARD_S
+        commit = [s for s in segments if s.end <= safe_end_s]
+        if not commit:
+            return
+        text = " ".join(s.text.strip() for s in commit).strip()
+        if not text:
+            return
+        self._committed_text = f"{self._committed_text} {text}".strip()
+        self._committed_samples += int(commit[-1].end * SAMPLE_RATE)
+
+    def stop(self) -> None:
+        self._stop_evt.set()
+        if self._thread is not None:
+            self._thread.join(timeout=2.0)
+
+    def finalize(self, final_audio: np.ndarray) -> str | None:
+        """Stop the worker, decode just the trailing tail, and return the
+        full transcript — or None if incremental decoding failed at any
+        point, telling the caller to fall back to a plain whole-decode."""
+        self.stop()
+        if self._failed:
+            return None
+        try:
+            tail = final_audio[self._committed_samples:]
+            tail_segments = self._decode(tail, self._committed_text)
+            tail_text = " ".join(s.text.strip() for s in tail_segments).strip()
+        except Exception:
+            return None
+        return f"{self._committed_text} {tail_text}".strip()
+
+
 class Daemon:
     def __init__(self, indicator: Indicator | None = None) -> None:
         ensure_home()
@@ -180,6 +300,8 @@ class Daemon:
         self._last_release = 0.0
         self._lock = threading.Lock()
         self._target_app = None  # captured at _start(), before the pill shows
+        self._model_lock = threading.Lock()  # guards all model.transcribe() calls
+        self._incremental: IncrementalTranscriber | None = None
 
         # Warm the Anthropic client (keychain read + TLS) off the critical
         # path so the first real dictation doesn't pay it (B1).
@@ -212,6 +334,12 @@ class Daemon:
         # Haiku call after key-release starts on a warm connection (B1).
         cleanup.prewarm_connection()
         self.recorder.start()
+        # B3: start decoding in the background while the user keeps
+        # talking, so long (hands-free) dictations only pay for the tail
+        # on release instead of the whole recording.
+        self._incremental = IncrementalTranscriber(
+            self.model, self._model_lock, self.vocab, self.corrections)
+        self._incremental.start(self.recorder)
 
     def _stop_and_process(self) -> None:
         with self._lock:
@@ -219,26 +347,40 @@ class Daemon:
                 return
             self.recording = False
         audio = self.recorder.stop()
+        incremental = self._incremental
+        self._incremental = None
         if audio.size < SAMPLE_RATE * 0.3:  # <0.3 s: accidental tap
+            if incremental is not None:
+                incremental.stop()
             self.indicator.hide()
             return
         target_app = self._target_app
-        threading.Thread(target=self._process, args=(audio, target_app),
+        threading.Thread(target=self._process,
+                          args=(audio, target_app, incremental),
                           daemon=True).start()
 
-    def _process(self, audio: np.ndarray, target_app=None) -> None:
+    def _process(self, audio: np.ndarray, target_app=None,
+                 incremental: "IncrementalTranscriber | None" = None) -> None:
         t0 = time.time()
         bundle = modes_mod.bundle_id_of(target_app)
         mode = modes_mod.mode_for(bundle, self.modes)
         try:
             self.indicator.set("transcribing")
-            segments, _ = self.model.transcribe(
-                audio, language="en", beam_size=1,
-                initial_prompt=vocab_mod.initial_prompt(
-                    self.vocab, self.corrections),
-                vad_filter=True,
-            )
-            raw = " ".join(s.text.strip() for s in segments).strip()
+            raw = None
+            if incremental is not None:
+                try:
+                    raw = incremental.finalize(audio)
+                except Exception:
+                    raw = None  # defensive: fall through to whole-decode
+            if raw is None:
+                with self._model_lock:
+                    segments, _ = self.model.transcribe(
+                        audio, language="en", beam_size=1,
+                        initial_prompt=vocab_mod.initial_prompt(
+                            self.vocab, self.corrections),
+                        vad_filter=True,
+                    )
+                raw = " ".join(s.text.strip() for s in segments).strip()
             t_whisper = time.time()
             if not raw:
                 self.indicator.set("error", "heard nothing")
