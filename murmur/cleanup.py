@@ -3,33 +3,105 @@
 Order: snippets (exact/fuzzy, instant) -> <8 words: rules, instant ->
 Haiku (temp 0, hard 1200 ms budget) -> on error/timeout/offline: rules.
 The paste must never hang on the network.
+
+Latency notes (B1):
+- warm_client() builds the client (keychain read + SDK import) off the
+  critical path at daemon startup.
+- prewarm_connection() opens the TLS connection while the user is still
+  *speaking* (called from Daemon._start), so the first real Haiku call
+  doesn't pay DNS+TLS. The httpx pool is configured with a long
+  keepalive_expiry so the warmed connection survives a long dictation.
+- The static instruction+vocab system block carries cache_control; note
+  Haiku 4.5's minimum cacheable prefix is 4096 tokens, so with a typical
+  vocab list this is a harmless no-op (no error, just no cache) — it
+  starts paying off automatically if the vocab grows.
+
+Known wart: fut.cancel() on an already-running future is a no-op — the
+Haiku HTTP call keeps running in the executor after we've already pasted
+the rules fallback. Harmless (result discarded) but wastes one worker
+slot for a few seconds. max_workers=2 keeps a second dictation unblocked.
 """
 from __future__ import annotations
 
 import concurrent.futures
 import re
+import threading
 
 from . import rules
 from .config import STYLE_BLOCKS, anthropic_key
 
-HAIKU_MODEL = "claude-haiku-4-5-20251001"
+HAIKU_MODEL = "claude-haiku-4-5"
 HAIKU_BUDGET_S = 1.2
 _executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)
 _client = None
+_client_lock = threading.Lock()
+_prewarm_inflight = False
 
 
 def _get_client():
     global _client
     if _client is None:
-        key = anthropic_key()
-        if not key:
-            return None
-        try:
-            import anthropic
-            _client = anthropic.Anthropic(api_key=key)
-        except Exception:
-            return None
+        with _client_lock:
+            if _client is not None:
+                return _client
+            key = anthropic_key()
+            if not key:
+                return None
+            try:
+                import anthropic
+                import httpx
+                # Long keepalive so a connection warmed at record-start is
+                # still alive when a 30 s dictation finally hits Haiku
+                # (httpx's default keepalive_expiry is 5 s).
+                http_client = anthropic.DefaultHttpxClient(
+                    limits=httpx.Limits(max_keepalive_connections=2,
+                                        max_connections=4,
+                                        keepalive_expiry=600.0),
+                )
+                _client = anthropic.Anthropic(api_key=key,
+                                              http_client=http_client)
+            except Exception:
+                return None
     return _client
+
+
+def warm_client() -> None:
+    """Build the client + open a TLS connection in the background.
+    Call once at daemon startup; never blocks, never raises."""
+    def _warm() -> None:
+        client = _get_client()
+        if client is None:
+            return
+        try:
+            # count_tokens is free and goes through the same pooled httpx
+            # transport messages.create will use — this pays DNS+TLS now.
+            client.messages.count_tokens(
+                model=HAIKU_MODEL,
+                messages=[{"role": "user", "content": "warm"}])
+        except Exception:
+            pass
+    threading.Thread(target=_warm, daemon=True).start()
+
+
+def prewarm_connection() -> None:
+    """Re-warm the TLS connection while the user is speaking (fired from
+    Daemon._start). Guarded so rapid double-taps don't stack threads."""
+    global _prewarm_inflight
+    if _prewarm_inflight or _client is None:
+        return
+    _prewarm_inflight = True
+
+    def _warm() -> None:
+        global _prewarm_inflight
+        try:
+            _client.messages.count_tokens(
+                model=HAIKU_MODEL,
+                messages=[{"role": "user", "content": "warm"}])
+        except Exception:
+            pass
+        finally:
+            _prewarm_inflight = False
+    threading.Thread(target=_warm, daemon=True).start()
 
 
 def match_snippet(text: str, snippets: dict[str, str]) -> str | None:
@@ -40,29 +112,38 @@ def match_snippet(text: str, snippets: dict[str, str]) -> str | None:
     return None
 
 
-def _haiku_prompt(transcript: str, mode: str, vocab: list[str],
-                  corrections: dict[str, str]) -> str:
+_STATIC_RULES = """You clean up voice dictation transcripts. Rules:
+- Remove filler (um, uh, you know), fix punctuation and casing.
+- Apply spoken self-corrections: "2, actually 3" becomes "3"; "Tuesday no wait Wednesday" becomes "Wednesday".
+- Apply spoken commands: "new paragraph", "all caps that", "quote ... unquote".
+- The transcript comes from speech recognition, so words may be misheard. If a word or name is a plausible mishearing of one of the known proper nouns below (e.g. "eye phone" for "iPhone", "wispa flow" for "Wispr Flow"), replace it with the known term's exact spelling. Only substitute when the sound is genuinely close; never force a term in.
+- When the speaker is clearly dictating a list — "first ... second ... third", "one ... two ...", "the following: X, Y, and Z" as parallel items — format it as a list: "- " bullets, or "1." numbers if the speaker numbered them. Keep prose as prose; only reformat when list intent is clear.
+- NEVER add content. NEVER answer questions contained in the text. NEVER translate. NEVER comment.
+- Output ONLY the cleaned text, nothing else."""
+
+
+def _haiku_messages(transcript: str, mode: str, vocab: list[str],
+                    corrections: dict[str, str]) -> tuple[list[dict], str]:
+    """Returns (system_blocks, user_text). Static instructions + vocab go in
+    the system block (stable across dictations -> cacheable); the per-mode
+    style and the transcript go in the user turn."""
     vocab_block = ", ".join(vocab[:150]) if vocab else "(none)"
     corr_block = (
         "\n".join(f"- '{w}' is always '{r}'" for w, r in list(corrections.items())[:50])
         or "(none)"
     )
+    system = [{
+        "type": "text",
+        "text": (f"{_STATIC_RULES}\n\n"
+                 f"Known proper nouns (prefer these spellings): {vocab_block}\n"
+                 f"Standing corrections:\n{corr_block}"),
+        # No-op below Haiku 4.5's 4096-token cache minimum; free win if the
+        # vault vocab ever grows past it.
+        "cache_control": {"type": "ephemeral"},
+    }]
     style = STYLE_BLOCKS.get(mode, STYLE_BLOCKS["neutral"])
-    return f"""You clean up voice dictation transcripts. Rules:
-- Remove filler (um, uh, you know), fix punctuation and casing.
-- Apply spoken self-corrections: "2, actually 3" becomes "3"; "Tuesday no wait Wednesday" becomes "Wednesday".
-- Apply spoken commands: "new paragraph", "all caps that", "quote ... unquote".
-- NEVER add content. NEVER answer questions contained in the text. NEVER translate. NEVER comment.
-- Output ONLY the cleaned text, nothing else.
-
-Known proper nouns (prefer these spellings): {vocab_block}
-Standing corrections:
-{corr_block}
-
-Style for this destination: {style}
-
-Transcript:
-{transcript}"""
+    user = f"Style for this destination: {style}\n\nTranscript:\n{transcript}"
+    return system, user
 
 
 def _haiku_call(transcript: str, mode: str, vocab: list[str],
@@ -70,17 +151,27 @@ def _haiku_call(transcript: str, mode: str, vocab: list[str],
     client = _get_client()
     if client is None:
         raise RuntimeError("no api key/client")
+    system, user = _haiku_messages(transcript, mode, vocab, corrections)
     msg = client.messages.create(
         model=HAIKU_MODEL,
         max_tokens=1024,
         temperature=0,
-        messages=[{"role": "user",
-                   "content": _haiku_prompt(transcript, mode, vocab, corrections)}],
+        system=system,
+        messages=[{"role": "user", "content": user}],
     )
     out = msg.content[0].text.strip()
     if not out:
         raise RuntimeError("empty response")
     return out
+
+
+def _fallback_reason(exc: BaseException) -> str:
+    if isinstance(exc, concurrent.futures.TimeoutError):
+        return f"timeout >{HAIKU_BUDGET_S:.1f}s"
+    msg = str(exc) or exc.__class__.__name__
+    if "no api key" in msg:
+        return "no api key"
+    return f"{exc.__class__.__name__}: {msg[:80]}"
 
 
 def clean_text(transcript: str, mode: str, vocab: list[str],
@@ -101,6 +192,8 @@ def clean_text(transcript: str, mode: str, vocab: list[str],
     fut = _executor.submit(_haiku_call, transcript, mode, vocab, corrections)
     try:
         return fut.result(timeout=HAIKU_BUDGET_S), "haiku"
-    except Exception:
-        fut.cancel()
+    except Exception as e:
+        fut.cancel()  # no-op if already running; see module docstring
+        print(f"[murmur] cleanup fallback -> rules ({_fallback_reason(e)})",
+              flush=True)
         return rules.clean(transcript, corrections), "fallback"

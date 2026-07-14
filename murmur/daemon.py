@@ -118,6 +118,10 @@ class Daemon:
         self._lock = threading.Lock()
         self._target_app = None  # captured at _start(), before the pill shows
 
+        # Warm the Anthropic client (keychain read + TLS) off the critical
+        # path so the first real dictation doesn't pay it (B1).
+        cleanup.warm_client()
+
         print(f"[murmur] loading {MODEL_NAME} …", flush=True)
         from faster_whisper import WhisperModel
         self.model = WhisperModel(MODEL_NAME, device="cpu", compute_type="int8")
@@ -141,6 +145,9 @@ class Daemon:
         self.corrections = load_corrections()
         self.indicator.set("listening",
                            "hands-free" if self.hands_free else "")
+        # Open the TLS connection while the user is still speaking so the
+        # Haiku call after key-release starts on a warm connection (B1).
+        cleanup.prewarm_connection()
         self.recorder.start()
 
     def _stop_and_process(self) -> None:
