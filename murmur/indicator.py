@@ -33,12 +33,24 @@ def write_state(state: str, detail: str = "") -> None:
 
 
 class Indicator:
-    """Runs Tk in its own thread; the daemon posts states via a queue."""
+    """Owns the Tk root + mainloop. Tk/Cocoa on macOS requires this to run on
+    the process's real main thread — v3's first cut spun Tk on a background
+    thread while pynput drove the main thread's runloop, and the two fought
+    over NSWindow ownership until Python crashed with an uncaught NSException.
+    Fix: Indicator now *is* the main-thread owner. The daemon's heavy init
+    (model load) and the hotkey listener run on a background thread instead,
+    started via `start_background`; state updates flow back through the same
+    queue as before, drained by Tk's own `after()` polling on the main loop.
+    """
 
     def __init__(self) -> None:
         self._q: queue.Queue[tuple[str, str]] = queue.Queue()
-        self._thread = threading.Thread(target=self._run, daemon=True)
-        self._thread.start()
+        self._root = None
+        try:
+            import tkinter as tk
+            self._tk = tk
+        except Exception:
+            self._tk = None  # headless: state file still works for the menu bar
 
     def set(self, state: str, detail: str = "") -> None:
         write_state(state, detail)
@@ -48,12 +60,22 @@ class Indicator:
         write_state("idle")
         self._q.put(("hide", ""))
 
-    # --- tk thread ---
-    def _run(self) -> None:
-        try:
-            import tkinter as tk
-        except Exception:
-            return  # headless: state file still works for the menu bar
+    def start_background(self, target, *args, **kwargs) -> None:
+        """Run the daemon's own work (model load + hotkey listener) on a
+        background thread, keeping this thread free for Tk's mainloop."""
+        threading.Thread(target=target, args=args, kwargs=kwargs,
+                          daemon=True).start()
+
+    def run(self) -> None:
+        """Build the Tk window and block on mainloop. Must be called from the
+        real main thread (i.e. from `if __name__ == '__main__'` / process
+        entry), after `start_background` has kicked off the daemon logic."""
+        if self._tk is None:
+            # headless fallback: just idle so the process stays alive for
+            # the background thread; state file still updates.
+            while True:
+                time.sleep(3600)
+        tk = self._tk
         self._root = tk.Tk()
         self._root.withdraw()
         self._root.overrideredirect(True)
@@ -67,8 +89,35 @@ class Indicator:
             font=("Menlo", 13), padx=18, pady=8)
         self._label.pack()
         self._root.configure(bg="#181818")
+        self._make_accessory_app()
         self._poll()
         self._root.mainloop()
+
+    def _make_accessory_app(self) -> None:
+        """Stop this process from ever becoming macOS's 'frontmost
+        application'. Root cause of the paste bug: showing a Tk window
+        activates the whole host process, so history.jsonl showed
+        org.python.python as frontmost during every dictation — the Cmd-V
+        keystroke was landing on Python, not whatever app the user was
+        dictating into. Wispr Flow's overlay avoids this by running as an
+        accessory app (like a menu-bar app / LSUIElement) that can never
+        take frontmost focus.
+
+        This MUST run after tk.Tk() has already built its window — Tk does
+        its own NSApplication/Cocoa setup on first Tk() call, and calling
+        NSApplication.sharedApplication() before that fights over who
+        initializes NSApp, which is what crashed with an uncaught
+        NSException on the previous attempt. Grabbing the shared instance
+        now just returns the one Tk already created and configured, so this
+        only flips a policy flag on it rather than racing its setup.
+        """
+        try:
+            from AppKit import (NSApplication,
+                                NSApplicationActivationPolicyAccessory)
+            NSApplication.sharedApplication().setActivationPolicy_(
+                NSApplicationActivationPolicyAccessory)
+        except Exception:
+            pass  # non-macOS or pyobjc missing: don't block startup over it
 
     def _place(self) -> None:
         self._root.update_idletasks()

@@ -53,15 +53,38 @@ class Recorder:
         return np.concatenate(self._frames).flatten()
 
 
-def paste_text(text: str) -> None:
-    """Copy -> Cmd-V -> restore prior clipboard (table stakes, spec §1)."""
+def paste_text(text: str, target_app=None) -> None:
+    """Copy -> reactivate original target app -> Cmd-V -> restore prior
+    clipboard (table stakes, spec §1).
+
+    `target_app` is the NSRunningApplication captured the instant the hotkey
+    was pressed (see Daemon._start). Murmur's own pill activates itself the
+    moment it's shown, so by the time we're ready to paste, the real
+    frontmost app is almost always Murmur, not whatever the user was
+    dictating into — every history.jsonl entry logged "org.python.python".
+    Explicitly re-activating the captured app right before sending Cmd-V is
+    what actually fixes where the paste lands, regardless of what stole
+    focus in between.
+    """
     prior = subprocess.run(["pbpaste"], capture_output=True).stdout
     subprocess.run(["pbcopy"], input=text.encode())
+    if target_app is not None:
+        try:
+            from AppKit import NSApplicationActivateIgnoringOtherApps
+            target_app.activateWithOptions_(NSApplicationActivateIgnoringOtherApps)
+            time.sleep(0.15)  # give it a beat to actually come forward
+        except Exception:
+            pass
     time.sleep(0.08)
-    subprocess.run([
-        "osascript", "-e",
-        'tell application "System Events" to keystroke "v" using command down',
-    ])
+    r = subprocess.run(
+        ["osascript", "-e",
+         'tell application "System Events" to keystroke "v" using command down'],
+        capture_output=True, text=True,
+    )
+    if r.returncode != 0:
+        raise RuntimeError(
+            f"paste failed (grant Accessibility to Terminal/python in "
+            f"System Settings > Privacy & Security): {r.stderr.strip()[:120]}")
 
     def restore() -> None:
         time.sleep(0.6)
@@ -71,7 +94,7 @@ def paste_text(text: str) -> None:
 
 
 class Daemon:
-    def __init__(self) -> None:
+    def __init__(self, indicator: Indicator | None = None) -> None:
         ensure_home()
         self.modes = load_modes()
         self.snippets = load_snippets()
@@ -83,12 +106,17 @@ class Daemon:
                 self.vocab = load_vocab()
             except Exception:
                 self.vocab = list(vocab_mod.SEED_TERMS)
-        self.indicator = Indicator()
+        # Indicator must own the process main thread (Tk/Cocoa requirement).
+        # main() creates it and calls .run() on the main thread; the daemon
+        # itself (model load, hotkey listener) is handed in already-built or
+        # runs headless if constructed standalone (e.g. tests).
+        self.indicator = indicator if indicator is not None else Indicator()
         self.recorder = Recorder()
         self.recording = False
         self.hands_free = False
         self._last_release = 0.0
         self._lock = threading.Lock()
+        self._target_app = None  # captured at _start(), before the pill shows
 
         print(f"[murmur] loading {MODEL_NAME} …", flush=True)
         from faster_whisper import WhisperModel
@@ -104,6 +132,10 @@ class Daemon:
             if self.recording:
                 return
             self.recording = True
+        # Capture the real target app BEFORE the pill shows and steals
+        # frontmost status — this is the fix. Querying frontmost after
+        # recording/processing always returns Murmur itself.
+        self._target_app = modes_mod.frontmost_app()
         # reload lightweight config every dictation so edits stick live
         self.snippets = load_snippets()
         self.corrections = load_corrections()
@@ -120,16 +152,18 @@ class Daemon:
         if audio.size < SAMPLE_RATE * 0.3:  # <0.3 s: accidental tap
             self.indicator.hide()
             return
-        threading.Thread(target=self._process, args=(audio,), daemon=True).start()
+        target_app = self._target_app
+        threading.Thread(target=self._process, args=(audio, target_app),
+                          daemon=True).start()
 
-    def _process(self, audio: np.ndarray) -> None:
+    def _process(self, audio: np.ndarray, target_app=None) -> None:
         t0 = time.time()
-        bundle = modes_mod.frontmost_bundle_id()
+        bundle = modes_mod.bundle_id_of(target_app)
         mode = modes_mod.mode_for(bundle, self.modes)
         try:
             self.indicator.set("transcribing")
             segments, _ = self.model.transcribe(
-                audio, language="en", beam_size=5,
+                audio, language="en", beam_size=1,
                 initial_prompt=vocab_mod.initial_prompt(
                     self.vocab, self.corrections),
                 vad_filter=True,
@@ -143,7 +177,7 @@ class Daemon:
             self.indicator.set("cleaning")
             cleaned, path = cleanup.clean_text(
                 raw, mode, self.vocab, self.corrections, self.snippets)
-            paste_text(cleaned)
+            paste_text(cleaned, target_app)
             ms = int((time.time() - t0) * 1000)
             self.indicator.set("pasted", f"{len(cleaned.split())}w · {ms}ms")
             history.append(bundle, mode, raw, cleaned, path, ms)
@@ -196,4 +230,15 @@ class Daemon:
 
 
 def main() -> None:
-    Daemon().run()
+    # Indicator owns this (the real process main) thread's runloop — Tk on
+    # macOS crashes if its window/mainloop are created off-thread. Everything
+    # else — model load (a few seconds) + the daemon itself + the hotkey
+    # listener — runs on a background thread so it can't block Tk's loop
+    # from coming up; see indicator.py for the full explanation.
+    indicator = Indicator()
+
+    def _run_daemon() -> None:
+        Daemon(indicator=indicator).run()
+
+    indicator.start_background(_run_daemon)
+    indicator.run()
