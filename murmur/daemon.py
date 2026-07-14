@@ -397,10 +397,32 @@ class Daemon:
                 self.indicator.hide()
                 return
             self.indicator.set("cleaning")
-            cleaned, path = cleanup.clean_text(
-                raw, mode, self.vocab, self.corrections, self.snippets)
+            # B5: cleanup.clean_text() already has its own rules-only
+            # fallback ladder and shouldn't raise, but if it somehow does,
+            # fall back to the raw transcript rather than losing the
+            # dictation entirely — better a slightly messy paste than none.
+            try:
+                cleaned, path = cleanup.clean_text(
+                    raw, mode, self.vocab, self.corrections, self.snippets)
+            except Exception as e:
+                print(f"[murmur] cleanup raised, pasting raw transcript: "
+                      f"{e.__class__.__name__}: {e}", flush=True)
+                cleaned, path = raw, "cleanup_error"
             t_clean = time.time()
-            paste_text(cleaned, target_app)
+            # B5: paste_text() writes `cleaned` to the clipboard before it
+            # ever attempts the keystroke, so on failure the clipboard
+            # already holds the text — no prior-clipboard restore happens
+            # in that case (see paste_text's own docstring). Here we just
+            # need to surface a persistent error instead of the "pasted"
+            # state, and skip history's normal latency path.
+            try:
+                paste_text(cleaned, target_app)
+            except Exception as e:
+                ms = int((time.time() - t0) * 1000)
+                self.indicator.set(
+                    "error", f"paste failed — text on clipboard: {str(e)[:40]}")
+                history.append(bundle, mode, raw, cleaned, "paste_error", ms)
+                return  # no sleep/hide: pill stays until the next dictation
             t_paste = time.time()
             ms = int((t_paste - t0) * 1000)
             self.indicator.set("pasted", f"{len(cleaned.split())}w · {ms}ms")
@@ -409,15 +431,18 @@ class Daemon:
                 "cleanup_ms": (t_clean - t_whisper) * 1000,
                 "paste_ms": (t_paste - t_clean) * 1000,
             })
-        except Exception as e:  # error state preserves transcript in history
+        except Exception as e:
+            # B5: everything else (Whisper crash, unexpected errors) — show
+            # the cause and leave the pill up until the next dictation
+            # starts (Daemon._start's own indicator.set("listening", ...)
+            # naturally replaces it); no auto-hide, so a real failure can't
+            # silently disappear before the user notices.
             self.indicator.set("error", str(e)[:60])
             try:
                 history.append(bundle, mode, locals().get("raw", ""), "",
                                "error", int((time.time() - t0) * 1000))
             except Exception:
                 pass
-            time.sleep(1.5)
-            self.indicator.hide()
 
     # --- hotkey ---
     def run(self) -> None:
