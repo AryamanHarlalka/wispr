@@ -31,7 +31,7 @@ from . import rules
 from .config import STYLE_BLOCKS, anthropic_key
 
 HAIKU_MODEL = "claude-haiku-4-5"
-HAIKU_BUDGET_S = 1.2
+HAIKU_BUDGET_S = 1.6
 _executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)
 _client = None
 _client_lock = threading.Lock()
