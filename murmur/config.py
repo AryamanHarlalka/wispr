@@ -118,8 +118,10 @@ def whisper_model() -> str:
     """Whisper model knob (B2). Priority: MURMUR_WHISPER_MODEL env ->
     ~/.murmur/whisper-model (first line) -> small.en.
 
-    distil-small.en is the candidate faster model; it stays opt-in until
-    its accuracy on the vault vocab is verified with real dictations.
+    Benchmarked 2026-07-16 (synthetic say-generated audio, isolated):
+    distil-small.en was 2-8x slower than small.en on this CPU and
+    hallucinated on technical audio — ruled out. base.en is ~3x faster
+    but misheard vocab terms ("daemon.py" -> "demon.py"); opt-in only.
     """
     env = os.environ.get("MURMUR_WHISPER_MODEL", "").strip()
     if env:

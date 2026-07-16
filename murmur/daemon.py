@@ -4,7 +4,7 @@ pasted at the cursor. Double-tap Right Option toggles hands-free mode.
 Pipeline: record (sounddevice, chunk-decoded incrementally in the
 background — see IncrementalTranscriber, B3) -> transcribe tail only
 (faster-whisper, vault-vocab initial_prompt) -> clean (snippets -> rules ->
-Haiku w/ 1200 ms budget -> rules fallback) -> paste (clipboard-preserving)
+Haiku w/ 2500 ms budget -> rules fallback) -> paste (clipboard-preserving)
 -> history. Audio never leaves the Mac; only cleaned *text* may go to the
 API (F1).
 """
@@ -23,9 +23,12 @@ from .indicator import Indicator
 
 SAMPLE_RATE = 16000
 DOUBLE_TAP_S = 0.4
-# small.en unless overridden — see config.whisper_model() (B2). distil-small.en
-# is wired as an opt-in knob; left off by default since we can't cheaply
-# verify it doesn't regress accuracy on the vault vocab in this session.
+# small.en unless overridden — see config.whisper_model() (B2). Benchmarked
+# 2026-07-16 on synthetic say-generated audio, isolated single process:
+# distil-small.en was 2-8x SLOWER here and hallucinated repetition loops on
+# technical audio — do not use it on this machine. base.en is ~3x faster
+# (0.7s vs 2.2s on a short utterance) but misheard "daemon.py" as
+# "demon.py" even with the vocab prompt; it stays an opt-in speed knob.
 MODEL_NAME = whisper_model()
 
 

@@ -1,8 +1,16 @@
 """F1 — hybrid cleanup ladder (spec §3, decided 2026-07-07).
 
 Order: snippets (exact/fuzzy, instant) -> <8 words: rules, instant ->
-Haiku (temp 0, hard 1200 ms budget) -> on error/timeout/offline: rules.
+Haiku (temp 0, hard 2500 ms budget) -> on error/timeout/offline: rules.
 The paste must never hang on the network.
+
+Budget history: 1.2 s shipped, bumped to 1.6 s after a live timeout, then
+to 2.5 s after synthetic-audio benchmarking (2026-07-16, isolated single
+process): on a ~110-word transcript Haiku completed in 1.0-1.5 s when it
+finished, but 3 of 7 calls blew the 1.6 s budget — a ~40% fallback rate
+on exactly the long rambling dictations where Haiku's self-correction
+handling matters most. 2.5 s covers the observed spread; short (<8 word)
+dictations never touch Haiku, so this costs nothing on the common path.
 
 Latency notes (B1):
 - warm_client() builds the client (keychain read + SDK import) off the
@@ -31,7 +39,7 @@ from . import rules
 from .config import STYLE_BLOCKS, anthropic_key
 
 HAIKU_MODEL = "claude-haiku-4-5"
-HAIKU_BUDGET_S = 1.6
+HAIKU_BUDGET_S = 2.5
 _executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)
 _client = None
 _client_lock = threading.Lock()
