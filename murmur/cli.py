@@ -31,8 +31,13 @@ def main() -> None:
     elif cmd == "menubar":
         from .menubar import main as run_mb
         run_mb()
+    elif cmd == "bench":
+        from .bench import main as run_bench
+        sys.argv = [sys.argv[0]] + args[1:]
+        run_bench()
     else:
-        print("usage: murmur [daemon|fix <wrong> <right>|vocab|history [n]|menubar]")
+        print("usage: murmur [daemon|fix <wrong> <right>|vocab|history [n]|"
+              "menubar|bench]")
         sys.exit(1)
 
 

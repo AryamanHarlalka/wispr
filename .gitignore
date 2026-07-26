@@ -3,3 +3,23 @@ __pycache__/
 *.pyc
 .DS_Store
 nohup.out
+
+# 0a bench harness: real voice clips + ground truth (personal), and any
+# ggml/whisper.cpp model weights staged for local experiments.
+bench/clips/
+bench/ground_truth.json
+bench/models/
+bench/dumps/
+
+# Belt-and-braces: no captured audio ever leaves this machine, wherever it lands.
+*.wav
+*.flac
+*.m4a
+*.mp3
+!bench/fixtures/*.wav
+
+# Runtime state / secrets
+.env
+.env.local
+~/.murmur/
+*.log

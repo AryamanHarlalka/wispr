@@ -32,12 +32,16 @@ DEFAULT_MODES = """\
 default = "neutral"
 """
 
+# NOTE: shipped defaults must stay impersonal — this file is public and this
+# template is written verbatim into a new user's ~/.murmur/snippets.toml on
+# first run. Personal snippets live only in that local file, never here.
 DEFAULT_SNIPPETS = """\
 # Murmur snippets (F5): spoken trigger -> inserted block.
+# Edit freely — this file is yours and is never committed or uploaded.
 [snippets]
-"my email" = "you@example.com"
-"my work email" = "you@work.example.com"
-"sign off" = "Best,\\nYour Name"
+# "my email"      = "you@example.com"
+# "my work email" = "you@work.example.com"
+# "sign off"      = "Best,\\nYour Name"
 """
 
 STYLE_BLOCKS = {
@@ -135,6 +139,76 @@ def whisper_model() -> str:
     except OSError:
         pass
     return DEFAULT_WHISPER_MODEL
+
+
+def load_config() -> dict:
+    """~/.murmur/config.toml — general knobs (currently: [stt]). Missing file
+    or missing keys just fall through to caller defaults."""
+    ensure_home()
+    p = MURMUR_HOME / "config.toml"
+    if not p.exists():
+        return {}
+    try:
+        with open(p, "rb") as f:
+            return tomllib.load(f)
+    except Exception:
+        return {}
+
+
+DEFAULT_STT_BACKEND = "faster-whisper"
+
+
+def stt_backend() -> str:
+    """STT backend knob (0c). Priority: MURMUR_STT_BACKEND env ->
+    ~/.murmur/config.toml [stt].backend -> faster-whisper.
+
+    Benchmarked 2026-07-23 on this (Intel, Iris Plus iGPU) machine: neither
+    mlx-whisper (Apple Silicon only, no wheel for this platform) nor
+    whisper.cpp's Metal backend (ggml explicitly compiles Metal out for
+    Intel macOS) nor whisper.cpp's CPU/BLAS backend (slower than
+    faster-whisper's CTranslate2 int8 at equal model size -- e.g. base.en
+    encode 1.8s vs 0.73s total) beat faster-whisper here. faster-whisper
+    stays the default; "whispercpp" is wired and working (see stt.py) for
+    portability to Apple Silicon hardware later, where mlx-whisper or
+    whisper.cpp+Metal would likely win instead.
+    """
+    env = os.environ.get("MURMUR_STT_BACKEND", "").strip()
+    if env:
+        return env
+    v = load_config().get("stt", {}).get("backend", "").strip()
+    return v or DEFAULT_STT_BACKEND
+
+
+DEFAULT_STT_BEAM_SIZE = 1
+
+
+def stt_beam_size() -> int:
+    """Beam size knob (0d): 1 trades a little accuracy for materially
+    faster decode; 5 (faster-whisper's own default) is slower. Priority:
+    MURMUR_STT_BEAM_SIZE env -> ~/.murmur/config.toml [stt].beam_size -> 1."""
+    env = os.environ.get("MURMUR_STT_BEAM_SIZE", "").strip()
+    if env:
+        try:
+            return int(env)
+        except ValueError:
+            pass
+    v = load_config().get("stt", {}).get("beam_size")
+    if isinstance(v, int):
+        return v
+    return DEFAULT_STT_BEAM_SIZE
+
+
+def stt_model() -> str:
+    """STT model knob (0c/B2). Priority: MURMUR_STT_MODEL env ->
+    ~/.murmur/config.toml [stt].model -> legacy whisper_model() (env/
+    ~/.murmur/whisper-model file) -> small.en."""
+    env = os.environ.get("MURMUR_STT_MODEL", "").strip()
+    if env:
+        return env
+    v = load_config().get("stt", {}).get("model", "").strip()
+    if v:
+        return v
+    return whisper_model()
 
 
 def anthropic_key() -> str | None:

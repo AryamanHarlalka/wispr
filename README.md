@@ -13,10 +13,7 @@ hard 1.2 s budget) and fall back to rules on any error/timeout/offline.
 
 ```bash
 cd ~/code/murmur
-python3 -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-python -m murmur vocab          # generate ~/.murmur/vocab.txt from the vault
-python -m murmur                # run the daemon
+./install/install.sh
 ```
 
 Optional extras:

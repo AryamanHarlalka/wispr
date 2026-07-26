@@ -10,26 +10,33 @@ API (F1).
 """
 from __future__ import annotations
 
+import os
 import subprocess
 import threading
 import time
+from pathlib import Path
 
 import numpy as np
 
-from . import cleanup, history, modes as modes_mod, vocab as vocab_mod
+from . import cleanup, history, modes as modes_mod, stt, vocab as vocab_mod
 from .config import (MURMUR_HOME, ensure_home, load_corrections, load_modes,
-                     load_snippets, load_vocab, whisper_model)
+                     load_snippets, load_vocab, stt_backend, stt_beam_size,
+                     stt_model)
 from .indicator import Indicator
 
 SAMPLE_RATE = 16000
 DOUBLE_TAP_S = 0.4
-# small.en unless overridden — see config.whisper_model() (B2). Benchmarked
-# 2026-07-16 on synthetic say-generated audio, isolated single process:
-# distil-small.en was 2-8x SLOWER here and hallucinated repetition loops on
-# technical audio — do not use it on this machine. base.en is ~3x faster
-# (0.7s vs 2.2s on a short utterance) but misheard "daemon.py" as
-# "demon.py" even with the vocab prompt; it stays an opt-in speed knob.
-MODEL_NAME = whisper_model()
+# Backend + model are a config swap (0c) -- see config.stt_backend()/
+# stt_model() for the current defaults and the benchmark reasoning behind
+# them. BEAM_SIZE and CONDITION_ON_PREVIOUS_TEXT are the 0d decode-tuning
+# knobs: beam_size=1 trades a little accuracy for materially faster decode
+# (measured in `murmur bench`); condition_on_previous_text=False stops the
+# runaway-repetition failure mode dictation is prone to (a long pause mid
+# -utterance otherwise biases the next segment toward repeating itself).
+BACKEND_NAME = stt_backend()
+MODEL_NAME = stt_model()
+BEAM_SIZE = stt_beam_size()
+CONDITION_ON_PREVIOUS_TEXT = False
 
 
 class Recorder:
@@ -232,10 +239,11 @@ class IncrementalTranscriber:
         if extra_prompt:
             prompt = f"{extra_prompt[-400:]} {prompt}"
         with self._model_lock:
-            segments, _ = self._model.transcribe(
-                audio, language="en", beam_size=1,
-                initial_prompt=prompt, vad_filter=True)
-        return list(segments)
+            segments = self._model.transcribe(
+                audio, language="en", beam_size=BEAM_SIZE,
+                initial_prompt=prompt, vad_filter=True,
+                condition_on_previous_text=CONDITION_ON_PREVIOUS_TEXT)
+        return segments
 
     def _maybe_commit_chunk(self, recorder: "Recorder") -> None:
         audio = recorder.snapshot()
@@ -310,9 +318,8 @@ class Daemon:
         # path so the first real dictation doesn't pay it (B1).
         cleanup.warm_client()
 
-        print(f"[murmur] loading {MODEL_NAME} …", flush=True)
-        from faster_whisper import WhisperModel
-        self.model = WhisperModel(MODEL_NAME, device="cpu", compute_type="int8")
+        print(f"[murmur] loading {BACKEND_NAME}/{MODEL_NAME} …", flush=True)
+        self.model = stt.build_backend(BACKEND_NAME, MODEL_NAME)
         print(f"[murmur] ready — hold Right Option to dictate "
               f"(vocab: {len(self.vocab)} terms, "
               f"llm: {'on' if cleanup._get_client() else 'off — rules only'})",
@@ -361,6 +368,14 @@ class Daemon:
         audio = self.recorder.stop()
         incremental = self._incremental
         self._incremental = None
+        _dump_dir = os.environ.get("MURMUR_DEBUG_DUMP_DIR", "").strip()
+        if _dump_dir and audio.size:
+            try:
+                Path(_dump_dir).mkdir(parents=True, exist_ok=True)
+                stt._write_wav(
+                    audio, str(Path(_dump_dir) / f"dump_{int(time.time())}.wav"))
+            except Exception:
+                pass
         if audio.size < SAMPLE_RATE * 0.3:  # <0.3 s: accidental tap
             if incremental is not None:
                 incremental.stop()
@@ -386,11 +401,12 @@ class Daemon:
                     raw = None  # defensive: fall through to whole-decode
             if raw is None:
                 with self._model_lock:
-                    segments, _ = self.model.transcribe(
-                        audio, language="en", beam_size=1,
+                    segments = self.model.transcribe(
+                        audio, language="en", beam_size=BEAM_SIZE,
                         initial_prompt=vocab_mod.initial_prompt(
                             self.vocab, self.corrections),
                         vad_filter=True,
+                        condition_on_previous_text=CONDITION_ON_PREVIOUS_TEXT,
                     )
                 raw = " ".join(s.text.strip() for s in segments).strip()
             t_whisper = time.time()

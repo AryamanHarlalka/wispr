@@ -11,14 +11,31 @@ from pathlib import Path
 
 from .config import MURMUR_HOME, VAULT, ensure_home
 
+# Shipped seeds are generic tooling terms only. Personal seeds — people's
+# names, private project codenames, employers — must NOT live in this file:
+# it is committed and shared. Put those in ~/.murmur/seed-terms.txt (one per
+# line), which is local-only and never leaves the machine.
 SEED_TERMS = [
-    "Alex", "Rao", "Maya", "Rao", "Sam", "Lee", "Anika",
-    "Raj", "Priya", "Dev Rao", "Nina",
-    "Atlas", "Northwind", "NASA", "Nest", "Murmur", "Nemo", "Neev",
-    "Acme", "ACME", "Crossfit", "Arbor", "WhisperX", "Wispr Flow",
-    "Superwhisper", "Vercel", "Supabase", "Anthropic", "Claude", "Fable",
-    "Haiku", "Sonnet", "Opus", "Ottawa", "Bangalore", "PPAI",
+    "Whisper", "WhisperX", "Anthropic", "Claude", "Haiku", "Sonnet", "Opus",
+    "Obsidian", "Supabase", "Vercel", "Postgres", "PostgreSQL", "Docker",
+    "TypeScript", "Python", "GitHub", "LaunchAgent", "macOS", "API", "CLI",
+    "repo", "PR", "webhook", "endpoint", "schema", "migration",
 ]
+
+
+def _personal_seeds() -> list[str]:
+    """Local-only seed terms from ~/.murmur/seed-terms.txt (one per line,
+    '#' comments allowed). Absent on a fresh install — that's fine."""
+    p = MURMUR_HOME / "seed-terms.txt"
+    if not p.exists():
+        return []
+    try:
+        return [
+            ln.strip() for ln in p.read_text().splitlines()
+            if ln.strip() and not ln.lstrip().startswith("#")
+        ]
+    except OSError:
+        return []
 
 _NAME_RE = re.compile(r"^[a-z0-9-]+$")
 
@@ -36,6 +53,8 @@ def _frontmatter_aliases(text: str) -> list[str]:
 
 def generate(vault: Path = VAULT) -> list[str]:
     terms: dict[str, None] = {t: None for t in SEED_TERMS}
+    for t in _personal_seeds():
+        terms.setdefault(t, None)
 
     def add(t: str) -> None:
         t = t.strip()
