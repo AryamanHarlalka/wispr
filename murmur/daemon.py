@@ -54,9 +54,44 @@ class Recorder:
             self._frames.append(indata.copy())
             self.level = float(np.abs(indata).mean())
 
+        try:
+            self._open_stream(cb)
+        except Exception as e:
+            # CoreAudio/PortAudio wedges in practice — PaErrorCode -9986
+            # ("Internal PortAudio error") and AUHAL -10851 ("Invalid
+            # Property Value") both show up after a device change, a
+            # sleep/wake cycle, or another process holding the input
+            # device. PortAudio's host-API state is process-global, so a
+            # plain retry hits the same wedged state; tearing it down and
+            # re-initialising usually clears it.
+            print(f"[murmur] input stream failed "
+                  f"({e.__class__.__name__}: {e}) — reinitialising "
+                  f"PortAudio and retrying once", flush=True)
+            self._reset_portaudio()
+            self._open_stream(cb)  # a second failure propagates to _start()
+
+    def _open_stream(self, cb) -> None:  # noqa: ANN001
         self._stream = self._sd.InputStream(
             samplerate=SAMPLE_RATE, channels=1, dtype="float32", callback=cb)
         self._stream.start()
+
+    def _reset_portaudio(self) -> None:
+        """Tear down and re-initialise the process-global PortAudio host
+        API. Best-effort: never raises, so the retry in start() is what
+        decides whether recording actually recovered."""
+        try:
+            if self._stream is not None:
+                try:
+                    self._stream.close()
+                except Exception:
+                    pass
+                self._stream = None
+            self._sd._terminate()
+            time.sleep(0.15)
+            self._sd._initialize()
+        except Exception as e:
+            print(f"[murmur] PortAudio reinit failed: "
+                  f"{e.__class__.__name__}: {e}", flush=True)
 
     def stop(self) -> np.ndarray:
         if self._stream:
@@ -331,6 +366,29 @@ class Daemon:
             if self.recording:
                 return
             self.recording = True
+        try:
+            self._begin_capture()
+        except Exception as e:
+            # A capture failure must never escape into the pynput callback.
+            # pynput re-raises callback exceptions out of the listener
+            # thread, which ends it: the process stays alive (launchd sees a
+            # healthy PID, KeepAlive never fires) but the hotkey is dead
+            # until a manual restart. That's the "it just stopped working"
+            # failure. Reset state so the *next* press can try again —
+            # self.recording was already True above, and leaving it stuck
+            # would deadlock every future press at the guard.
+            with self._lock:
+                self.recording = False
+            self._incremental = None
+            try:
+                self.recorder.stop()
+            except Exception:
+                pass
+            print(f"[murmur] could not start recording: "
+                  f"{e.__class__.__name__}: {e}", flush=True)
+            self.indicator.set("error", f"mic unavailable — {str(e)[:40]}")
+
+    def _begin_capture(self) -> None:
         # Capture the real target app BEFORE the pill shows and steals
         # frontmost status — this is the fix. Querying frontmost after
         # recording/processing always returns Murmur itself.
@@ -365,7 +423,17 @@ class Daemon:
             if not self.recording:
                 return
             self.recording = False
-        audio = self.recorder.stop()
+        try:
+            audio = self.recorder.stop()
+        except Exception as e:
+            # Same contract as _start(): closing a wedged stream can raise,
+            # and this runs on the pynput callback thread too. Drop the
+            # take rather than the listener.
+            self._incremental = None
+            print(f"[murmur] could not stop recording: "
+                  f"{e.__class__.__name__}: {e}", flush=True)
+            self.indicator.set("error", f"recording lost — {str(e)[:40]}")
+            return
         incremental = self._incremental
         self._incremental = None
         _dump_dir = os.environ.get("MURMUR_DEBUG_DUMP_DIR", "").strip()
@@ -496,9 +564,48 @@ class Daemon:
                 return
             self._stop_and_process()
 
-        with keyboard.Listener(on_press=on_press, on_release=on_release) as ln:
-            print("[murmur] daemon running. Ctrl-C to quit.", flush=True)
-            ln.join()
+        def _guard(fn, name):
+            """Last line of defence around every pynput callback.
+
+            pynput propagates an exception raised inside a callback out of
+            the listener thread and stops the listener. Because the daemon
+            process itself survives that, launchd's KeepAlive never fires
+            and the tool looks alive while the hotkey is deaf. Nothing
+            reached from a callback is allowed to raise past this point."""
+            def wrapped(key):  # noqa: ANN001
+                try:
+                    fn(key)
+                except Exception as e:
+                    print(f"[murmur] {name} handler error: "
+                          f"{e.__class__.__name__}: {e}", flush=True)
+                    try:
+                        self.indicator.set("error", str(e)[:60])
+                    except Exception:
+                        pass
+            return wrapped
+
+        while True:
+            with keyboard.Listener(
+                    on_press=_guard(on_press, "on_press"),
+                    on_release=_guard(on_release, "on_release")) as ln:
+                print("[murmur] daemon running. Ctrl-C to quit.", flush=True)
+                ln.join()
+            # The guards mean our own code can no longer end the listener,
+            # but macOS still can: it disables an event tap that blocks for
+            # too long, and revoking/regranting Accessibility tears the tap
+            # down. Rebuild rather than fall out of run() into a live-but-
+            # deaf process. Any recording in flight is abandoned first so
+            # the new listener starts from a known state.
+            try:
+                with self._lock:
+                    self.recording = False
+                self.hands_free = False
+                self.recorder.stop()
+            except Exception:
+                pass
+            print("[murmur] hotkey listener stopped — restarting in 2 s",
+                  flush=True)
+            time.sleep(2.0)
 
 
 def main() -> None:
