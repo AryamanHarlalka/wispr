@@ -1,58 +1,191 @@
 # Murmur
 
-Local, vault-aware voice dictation for the Mac. Hold **Right Option**
-anywhere, speak, release — cleaned text pastes at the cursor.
-Double-tap Right Option for hands-free mode (tap once to stop).
+Local voice dictation for macOS. Hold **Right Option**, speak, release — clean
+text appears wherever your cursor is. Works in any app.
 
-Audio never leaves the Mac. Transcription is local (faster-whisper
-`small.en`). Cleanup is hybrid: snippets and short utterances go through
-instant local rules; longer ones go to Claude Haiku (text only, temp 0,
-hard 1.2 s budget) and fall back to rules on any error/timeout/offline.
+Your voice never leaves your Mac. Transcription runs entirely on your own
+hardware, so there's no subscription, no per-word cost, and nothing to trust.
+
+---
 
 ## Install
 
-```bash
-cd ~/code/murmur
-./install/install.sh
-```
-
-Optional extras:
+You need a Mac. Everything else the installer handles.
 
 ```bash
-# Haiku cleanup (recommended): store the API key once in the keychain
-security add-generic-password -s murmur-anthropic -a murmur -w '<ANTHROPIC_API_KEY>'
-# menu-bar state icon + recent-5 (separate process)
-pip install rumps && python -m murmur menubar &
+git clone https://github.com/your-username/murmur.git ~/code/murmur
+cd ~/code/murmur && ./install/install.sh
 ```
 
-macOS permissions (System Settings → Privacy & Security):
-- **Accessibility** — for the global hotkey + paste keystroke (grant to
-  your terminal or the python binary in `.venv`)
-- **Microphone** — first run will prompt
+It takes about five minutes, most of it downloading the speech model. The
+installer will:
 
-## Commands
+1. find a suitable Python (installing one is the only thing it can't do for you)
+2. set up an isolated environment so nothing touches your system Python
+3. pick the fastest transcription engine **for your specific Mac** — Apple
+   Silicon gets the GPU backend, Intel gets an optimised CPU one
+4. offer to store an Anthropic API key (optional — see below)
+5. install it as a background service that starts at login
+6. walk you through the two macOS permissions
+7. verify the whole thing actually works, and tell you if it doesn't
 
-| command | what |
+After that there's no terminal, ever. It's just there.
+
+### If you don't have Python 3.10+
+
+```bash
+brew install python@3.12
+```
+
+No Homebrew? Get it at [brew.sh](https://brew.sh), or download Python from
+[python.org](https://www.python.org/downloads/macos/).
+
+---
+
+## The two permissions
+
+macOS won't let *any* app read your keyboard or microphone without explicit
+consent, and Apple deliberately makes this un-scriptable. So this is the one
+part you do by hand. The installer walks you through it and puts the path you
+need on your clipboard.
+
+**Accessibility** — lets Murmur notice you're holding the hotkey, and paste the
+result. System Settings → Privacy & Security → Accessibility → **[+]** → press
+`Cmd-Shift-G` → paste the path → toggle it **on**.
+
+**Microphone** — macOS prompts the first time you dictate. Click OK.
+
+> The path must be the *real* Python binary, not a symlink — macOS attributes
+> permissions to the resolved file. The installer resolves it for you; if you're
+> doing it by hand, `murmur doctor` prints the exact path to use.
+
+---
+
+## The API key (optional)
+
+Murmur always transcribes locally. A key only affects the **cleanup** step:
+
+| | Without a key | With a key |
+|---|---|---|
+| Transcription | on your Mac | on your Mac |
+| Audio uploaded | never | never |
+| Cleanup | local rules | Claude Haiku |
+| Filler removal | basic | thorough |
+| Spoken corrections | no | "Tuesday, no wait, Wednesday" → "Wednesday" |
+| Cost | free | a fraction of a cent per dictation, billed to you |
+
+The key is **yours** — get one at
+[console.anthropic.com](https://console.anthropic.com/settings/keys). It's
+stored in your macOS Keychain, never on disk and never in this repo.
+
+```bash
+murmur set-key            # add or replace
+murmur set-key --clear    # remove; falls back to local rules
+```
+
+Only the transcribed **text** is ever sent, and only when a key is present.
+
+---
+
+## Using it
+
+| | |
 |---|---|
-| `python -m murmur` | run the daemon (PTT + hands-free) |
-| `python -m murmur fix <wrong> <right>` | teach a correction (sticks everywhere) |
-| `python -m murmur vocab` | regenerate vault vocab (run weekly / after big vault changes) |
-| `python -m murmur history [n]` | show last n dictations |
-| `python -m murmur menubar` | menu-bar companion (optional) |
+| **Dictate** | Hold Right Option, speak, release |
+| **Hands-free** | Double-tap Right Option; tap once to stop |
+| **Fix a word it keeps mishearing** | `murmur fix "wrong" "right"` |
+| **See recent dictations** | `murmur history` |
+| **Check what's wrong** | `murmur doctor` |
+| **Restart it** | `murmur restart` |
 
-## Config (`~/.murmur/`)
+Text appears almost immediately — the local result pastes right away, then
+quietly refines itself a moment later if the cleanup pass improves on it. You
+generally won't notice the second step, and it turns itself off in code editors
+and terminals, where auto-indent and autocomplete make rewriting unsafe.
 
-- `modes.toml` — bundle-id → mode (casual / email / technical / neutral)
-- `snippets.toml` — spoken trigger → inserted block
-- `corrections.tsv` — learned fixes (also fed to Whisper + Haiku)
-- `vocab.txt` — vault-derived proper nouns (terms only, never facts)
-- `history.jsonl` — every dictation (ts, app, raw, cleaned, path, latency)
+Prefer the text to land once and never change?
 
-## Privacy contract
+```toml
+# ~/.murmur/config.toml
+[paste]
+revise = false
+```
 
-- Audio: never leaves the Mac.
-- API traffic: cleaned-up **text** only, and only when Haiku cleanup is on
-  (no key in env/keychain = rules-only, silently).
-- `vocab.txt` carries proper-noun *terms* from the vault, never facts/notes.
+---
 
-Spec: `ops/work/the-bench/voice-flow/murmur-v3-spec.md` in the vault.
+## Making it yours
+
+Everything personal lives in `~/.murmur/`, outside this repo, and is never
+committed or uploaded.
+
+| File | What it does |
+|---|---|
+| `config.toml` | backend, model, paste behaviour |
+| `snippets.toml` | say "my email", get your email address |
+| `corrections.tsv` | permanent fixes for words it mishears |
+| `seed-terms.txt` | names and jargon to recognise (one per line) |
+| `modes.toml` | per-app tone — casual in Slack, precise in editors |
+| `history.jsonl` | every dictation, local only |
+
+**Obsidian users:** point Murmur at your vault and it learns the proper nouns
+you actually use, so it stops mangling names.
+
+```bash
+echo "/path/to/your/vault" > ~/.murmur/vault-path && murmur vocab
+```
+
+Only names are extracted — page titles, aliases, folder names. Never note
+content.
+
+---
+
+## When something breaks
+
+```bash
+murmur doctor
+```
+
+It checks for duplicate daemons, a dead hotkey listener, missing permissions, a
+wedged microphone, a broken model and an invalid key — and prints the exact
+command to fix whatever it finds. Start here; it usually saves the debugging.
+
+Logs, if you want them: `~/.murmur/logs/daemon.err.log`
+
+### Uninstall
+
+```bash
+./install/uninstall.sh            # remove the service, keep your settings
+./install/uninstall.sh --purge    # remove everything, including the key
+```
+
+---
+
+## How it works
+
+```
+Right Option held  →  record (locally)
+                   →  transcribe (locally, Whisper)
+                   →  clean up (local rules; Haiku if you added a key)
+                   →  paste at your cursor
+```
+
+Transcription decodes *while you're still speaking*, so a long dictation doesn't
+pay for the whole recording when you let go. Cleanup happens after the paste,
+not before it, so the network is never between you and your text.
+
+**Backends are chosen per machine**, because the right answer is hardware
+dependent — MLX on the Apple GPU where that exists, CTranslate2 on CPU where it
+doesn't. Measured rather than assumed: see [BENCHMARKS.md](BENCHMARKS.md).
+
+---
+
+## Requirements
+
+- macOS (Apple Silicon or Intel)
+- Python 3.10+
+- ~1GB disk for the speech model
+- No internet needed to dictate — only for the optional cleanup pass
+
+## Licence
+
+MIT — see [LICENSE](LICENSE).

@@ -182,6 +182,59 @@ def _fallback_reason(exc: BaseException) -> str:
     return f"{exc.__class__.__name__}: {msg[:80]}"
 
 
+def instant_result(transcript: str, mode: str, vocab: list[str],
+                   corrections: dict[str, str], snippets: dict[str, str],
+                   llm_enabled: bool = True):
+    """Instant-paste split (2026-07-30). Returns (text, path, future|None).
+
+    `text` is what should be pasted RIGHT NOW — the snippet, or the local
+    rules result. `future` is an in-flight Haiku call when one is worth
+    waiting for, or None when the instant answer is already final (snippet,
+    short utterance, or no LLM configured).
+
+    This exists because the old clean_text() put the network on the paste's
+    critical path: nothing appeared on screen until Haiku answered or the
+    2.5 s budget expired. Since the rules result is available immediately
+    and is what a timeout would have produced anyway, there is no reason to
+    make the user watch a blank cursor for it. The caller pastes `text`,
+    then optionally revises once the future resolves.
+    """
+    transcript = transcript.strip()
+    if not transcript:
+        return "", "rules", None
+
+    snip = match_snippet(transcript, snippets)
+    if snip is not None:
+        return snip, "snippet", None
+
+    base = rules.clean(transcript, corrections)
+    if len(transcript.split()) < 8 or not llm_enabled or _get_client() is None:
+        return base, "rules", None
+
+    fut = _executor.submit(_haiku_call, transcript, mode, vocab, corrections)
+    return base, "rules-instant", fut
+
+
+def await_revision(fut, timeout: float) -> tuple[str | None, str]:
+    """Wait up to `timeout` for an instant_result() future.
+
+    Returns (improved_text_or_None, path). None means keep what was already
+    pasted — either Haiku missed the window, errored, or produced nothing
+    better. Never raises: a failed revision must be a no-op, not an
+    incident, because the user already has usable text on screen."""
+    if fut is None:
+        return None, "rules"
+    try:
+        out = fut.result(timeout=timeout)
+    except Exception as e:
+        print(f"[murmur] revision skipped ({_fallback_reason(e)})", flush=True)
+        return None, "rules"
+    out = (out or "").strip()
+    if not out:
+        return None, "rules"
+    return out, "haiku"
+
+
 def clean_text(transcript: str, mode: str, vocab: list[str],
                corrections: dict[str, str], snippets: dict[str, str],
                llm_enabled: bool = True) -> tuple[str, str]:

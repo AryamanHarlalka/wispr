@@ -1,7 +1,59 @@
 # Murmur — latency and accuracy measurements
 
-Last run: **2026-07-27**, macOS 15.7.7, Intel x86_64 (Iris Plus iGPU), faster-whisper
-via CTranslate2 int8, `beam_size=1`.
+Last run: **2026-07-30**, macOS 15.7.7, Intel x86_64 (i5-1038NG7, Iris Plus iGPU),
+faster-whisper via CTranslate2 int8, `beam_size=1`.
+
+---
+
+## 0. 2026-07-30 — what changed and what it bought
+
+Two changes shipped together, both aimed at the latency floor identified in §1
+and §4 below (median 4.4 s across 120 real dictations, 83% over 3 s, dominated
+by fixed overhead rather than audio length).
+
+**Change 1 — default model `small.en` → `base.en`.** Same-day A/B on the same
+clips and the same machine:
+
+| Clip | `small.en` whisper | `base.en` whisper | Speedup | `small.en` WER | `base.en` WER |
+|---|---|---|---|---|---|
+| short (6 s) | 1,848 ms | **842 ms** | 2.2× | 37.5% | **12.5%** |
+| medium (20 s) | 2,330 ms | **764 ms** | 3.1× | **11.1%** | 18.5% |
+
+Model load also halves (2.70 s → 1.45 s), which only affects daemon startup.
+
+Accuracy is a genuine trade, not a free win: `base.en` is much better on the
+short clip and worse on the medium one. The medium delta is a single proper
+noun — both models fail "loop in Anika" (`base.en` → "loop an icon",
+`small.en` → "loop an IKEA"), so neither is *right*; they are differently
+wrong, and the vocab + corrections layers are what actually fix that class of
+error. Given latency was the dominant real-use complaint and the speedup is
+2–3×, `base.en` is the correct default on this hardware.
+
+Revert in one line: `echo small.en > ~/.murmur/whisper-model && murmur restart`
+
+**Change 2 — cleanup moved off the paste's critical path.** Previously nothing
+appeared on screen until Haiku answered or its 2.5 s budget expired; 18% of
+calls waited the entire budget and then pasted the local-rules result anyway.
+Now the rules result pastes immediately and Haiku revises it in place if it
+returns something better within the window.
+
+Perceived latency is therefore no longer `whisper + cleanup` but `whisper`
+alone:
+
+| | Before (07-27) | After (07-30) |
+|---|---|---|
+| short clip, time to text on screen | 5,061 ms | **~850 ms** |
+| medium clip, time to text on screen | 5,165 ms | **~770 ms** |
+
+Roughly a **6× reduction in time-to-text**, with the cleanup quality arriving a
+beat later instead of being paid for up front. The §2 and §4 numbers below
+predate this change and measure the old blocking path — they are kept because
+the model comparison is still valid, but the "total" column no longer describes
+what a user experiences.
+
+⚠ Both figures above are clip measurements. The honest production number is a
+fresh §1 pass over `history.jsonl` after a week of real use on the new defaults;
+until then, treat the 6× as indicative rather than established.
 
 ---
 

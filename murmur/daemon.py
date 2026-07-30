@@ -20,8 +20,9 @@ import numpy as np
 
 from . import cleanup, history, modes as modes_mod, stt, vocab as vocab_mod
 from .config import (MURMUR_HOME, ensure_home, load_corrections, load_modes,
-                     load_snippets, load_vocab, stt_backend, stt_beam_size,
-                     stt_model)
+                     load_snippets, load_vocab, paste_instant, paste_revise,
+                     revise_max_chars, revise_window_s, stt_backend,
+                     stt_beam_size, stt_model)
 from .indicator import Indicator
 
 SAMPLE_RATE = 16000
@@ -214,6 +215,36 @@ def paste_text(text: str, target_app=None) -> None:
     threading.Thread(target=restore, daemon=True).start()
 
 
+def _send_backspaces(n: int) -> None:
+    """n synthetic backspaces via Quartz, used to retract an instant paste
+    before replacing it (see Daemon._revise_in_place).
+
+    Posted in small batches with a breath between them: CGEventPost is
+    asynchronous and a few hundred events dispatched in a tight loop can
+    outrun a slow app's event handling, which shows up as some of the
+    deletions silently not landing — much worse than deleting nothing.
+    """
+    import Quartz
+    kVK_Delete = 51
+    src = Quartz.CGEventSourceCreate(Quartz.kCGEventSourceStateHIDSystemState)
+    for i in range(n):
+        down = Quartz.CGEventCreateKeyboardEvent(src, kVK_Delete, True)
+        up = Quartz.CGEventCreateKeyboardEvent(src, kVK_Delete, False)
+        Quartz.CGEventPost(Quartz.kCGHIDEventTap, down)
+        Quartz.CGEventPost(Quartz.kCGHIDEventTap, up)
+        if i % 40 == 39:
+            time.sleep(0.012)
+
+
+def _frontmost_pid() -> int | None:
+    try:
+        from AppKit import NSWorkspace
+        front = NSWorkspace.sharedWorkspace().frontmostApplication()
+        return None if front is None else int(front.processIdentifier())
+    except Exception:
+        return None
+
+
 CHUNK_INTERVAL_S = 3.0   # how often the background worker checks for new audio
 MIN_CHUNK_AUDIO_S = 4.0  # don't bother decoding a chunk shorter than this
 TRAILING_GUARD_S = 0.6   # don't commit a VAD segment that ends this close to
@@ -348,6 +379,10 @@ class Daemon:
         self._target_app = None  # captured at _start(), before the pill shows
         self._model_lock = threading.Lock()  # guards all model.transcribe() calls
         self._incremental: IncrementalTranscriber | None = None
+        # Monotonic dictation counter. A pending in-place revision compares
+        # this before touching the keyboard: if it moved, a newer dictation
+        # owns the cursor and the revision must not fire.
+        self._dictation_seq = 0
 
         # Warm the Anthropic client (keychain read + TLS) off the critical
         # path so the first real dictation doesn't pay it (B1).
@@ -366,6 +401,7 @@ class Daemon:
             if self.recording:
                 return
             self.recording = True
+            self._dictation_seq += 1
         try:
             self._begin_capture()
         except Exception as e:
@@ -484,17 +520,25 @@ class Daemon:
                 self.indicator.hide()
                 return
             self.indicator.set("cleaning")
-            # B5: cleanup.clean_text() already has its own rules-only
-            # fallback ladder and shouldn't raise, but if it somehow does,
-            # fall back to the raw transcript rather than losing the
-            # dictation entirely — better a slightly messy paste than none.
+            # B5: cleanup shouldn't raise, but if it somehow does, fall back
+            # to the raw transcript rather than losing the dictation
+            # entirely — better a slightly messy paste than none.
+            revision_fut = None
             try:
-                cleaned, path = cleanup.clean_text(
-                    raw, mode, self.vocab, self.corrections, self.snippets)
+                if paste_instant():
+                    # Instant mode: `cleaned` is the local rules result,
+                    # available with no network wait. `revision_fut` is the
+                    # Haiku call still in flight; it revises after the paste
+                    # instead of delaying it.
+                    cleaned, path, revision_fut = cleanup.instant_result(
+                        raw, mode, self.vocab, self.corrections, self.snippets)
+                else:
+                    cleaned, path = cleanup.clean_text(
+                        raw, mode, self.vocab, self.corrections, self.snippets)
             except Exception as e:
                 print(f"[murmur] cleanup raised, pasting raw transcript: "
                       f"{e.__class__.__name__}: {e}", flush=True)
-                cleaned, path = raw, "cleanup_error"
+                cleaned, path, revision_fut = raw, "cleanup_error", None
             t_clean = time.time()
             # B5: paste_text() writes `cleaned` to the clipboard before it
             # ever attempts the keystroke, so on failure the clipboard
@@ -518,6 +562,11 @@ class Daemon:
                 "cleanup_ms": (t_clean - t_whisper) * 1000,
                 "paste_ms": (t_paste - t_clean) * 1000,
             })
+            # The user already has text. Anything below is a bonus pass and
+            # must never be able to damage that outcome.
+            if revision_fut is not None:
+                self._revise_in_place(revision_fut, cleaned, target_app,
+                                      bundle, mode, raw, t0)
         except Exception as e:
             # B5: everything else (Whisper crash, unexpected errors) — show
             # the cause and leave the pill up until the next dictation
@@ -530,6 +579,68 @@ class Daemon:
                                "error", int((time.time() - t0) * 1000))
             except Exception:
                 pass
+
+    def _revise_in_place(self, fut, pasted: str, target_app, bundle: str,
+                         mode: str, raw: str, t0: float) -> None:
+        """Second-chance cleanup: replace the instant paste with Haiku's
+        version — but only when it is provably safe.
+
+        Every guard below exists because these are real keystrokes going
+        into a live document. Skipping a revision costs the user slightly
+        rougher text they already have; getting it wrong deletes characters
+        that were never ours. The asymmetry decides every close call here:
+        when in doubt, do nothing.
+        """
+        if not paste_revise():
+            return
+        seq = self._dictation_seq
+        remaining = revise_window_s() - (time.time() - t0)
+        if remaining <= 0:
+            return
+        improved, path = cleanup.await_revision(fut, remaining)
+        if improved is None or improved == pasted:
+            return
+        # Guard 1 — length. Retraction is one backspace per character, so a
+        # long paste means hundreds of keystrokes: slow, and a wider window
+        # for something else to land mid-sequence.
+        if len(pasted) > revise_max_chars():
+            print(f"[murmur] revision skipped ({len(pasted)} chars > "
+                  f"{revise_max_chars()} limit)", flush=True)
+            return
+        # Guard 2 — code editors and terminals. Auto-indent, bracket
+        # pairing and autocomplete mean the characters on screen are no
+        # longer the characters we pasted, so a per-character retraction
+        # cannot be trusted to remove exactly our own text.
+        if mode == "technical":
+            return
+        # Guard 3 — a newer dictation started, so the cursor belongs to it.
+        if seq != self._dictation_seq or self.recording:
+            return
+        # Guard 4 — focus moved. Backspacing into a different app deletes
+        # whatever happens to be under the cursor there.
+        if target_app is not None:
+            try:
+                if _frontmost_pid() != int(target_app.processIdentifier()):
+                    return
+            except Exception:
+                return
+        try:
+            _send_backspaces(len(pasted))
+            paste_text(improved, target_app)
+        except Exception as e:
+            # The rules text is already gone in the worst case, but the
+            # improved text is on the clipboard (paste_text writes it before
+            # the keystroke), so Cmd-V recovers.
+            print(f"[murmur] revision failed mid-flight: "
+                  f"{e.__class__.__name__}: {e}", flush=True)
+            self.indicator.set("error", "revision failed — Cmd-V to recover")
+            return
+        ms = int((time.time() - t0) * 1000)
+        self.indicator.set("pasted", f"{len(improved.split())}w · {ms}ms ✎")
+        try:
+            history.append(bundle, mode, raw, improved, path, ms)
+        except Exception:
+            pass
 
     # --- hotkey ---
     def run(self) -> None:

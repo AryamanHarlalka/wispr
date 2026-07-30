@@ -9,10 +9,21 @@ PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 MURMUR_HOME="${MURMUR_HOME:-$HOME/.murmur}"
 
 echo "==> Stopping Murmur"
-launchctl bootout "gui/$UID/$LABEL" 2>/dev/null || true
-launchctl unload  "$PLIST"          2>/dev/null || true
-rm -f "$PLIST"
-echo "  ✓ Service stopped and LaunchAgent removed"
+# Remove EVERY murmur/wispr agent, not just the current label: older installs
+# left differently-named plists behind, and a leftover one silently starts a
+# second daemon that fights the first for the microphone.
+REMOVED=0
+while IFS= read -r f; do
+  [[ -z "$f" ]] && continue
+  lbl="$(basename "$f" .plist)"
+  launchctl bootout "gui/$UID/$lbl" 2>/dev/null || true
+  launchctl unload  "$f"            2>/dev/null || true
+  rm -f "$f"
+  echo "  ✓ Removed $lbl"
+  REMOVED=$((REMOVED + 1))
+done < <(find "$HOME/Library/LaunchAgents" -maxdepth 1 \
+              \( -iname '*murmur*.plist' -o -iname '*wispr*.plist' \) 2>/dev/null)
+(( REMOVED )) || echo "  · No Murmur LaunchAgent was installed"
 
 if [[ "${1:-}" == "--purge" ]]; then
   rm -rf "$MURMUR_HOME"

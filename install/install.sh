@@ -41,10 +41,30 @@ ok "macOS $(sw_vers -productVersion)"
 
 ARCH="$(uname -m)"
 if [[ "$ARCH" == "arm64" ]]; then
-  ok "Apple Silicon ($ARCH) — transcription will be quick"
+  ok "Apple Silicon ($ARCH) — the GPU transcription backend is available"
+  USE_MLX=1
 else
-  ok "Intel ($ARCH)"
-  warn "Intel Macs transcribe slower. If it drags, run: echo base.en > $MURMUR_HOME/whisper-model"
+  ok "Intel ($ARCH) — using the optimised CPU backend"
+  USE_MLX=0
+fi
+
+# ── 1b. Clear out any older/competing install ─────────────────────────────
+# Two daemons on one microphone produce intermittent CoreAudio failures that
+# present as "it randomly stops working" and are near-impossible to diagnose
+# from the symptoms. This cost two weeks once; never again.
+STALE=()
+while IFS= read -r f; do [[ -n "$f" ]] && STALE+=("$f"); done < <(
+  find "$HOME/Library/LaunchAgents" -maxdepth 1 -iname '*murmur*.plist' \
+       -o -maxdepth 1 -iname '*wispr*.plist' 2>/dev/null | grep -v "/$LABEL.plist$" || true
+)
+if (( ${#STALE[@]} )); then
+  step "Removing ${#STALE[@]} older Murmur service(s)"
+  for f in "${STALE[@]}"; do
+    lbl="$(basename "$f" .plist)"
+    launchctl bootout "gui/$UID/$lbl" 2>/dev/null || true
+    rm -f "$f"
+    ok "Removed $lbl"
+  done
 fi
 
 # Find a Python >= 3.10. Don't trust `command -v python3`: on stock macOS that
@@ -105,15 +125,34 @@ else
   warn "rumps failed to install — menu bar icon unavailable, dictation unaffected"
 fi
 
+# Apple Silicon only: MLX runs Whisper on the GPU and is several times faster
+# than the CPU backend. There is no Intel wheel, so this is skipped there and
+# murmur.config.resolve_backend() falls back to faster-whisper automatically.
+if (( USE_MLX )); then
+  if "$PY" -m pip install --quiet mlx-whisper 2>/dev/null; then
+    ok "GPU transcription installed (mlx-whisper) — Murmur will use it automatically"
+  else
+    warn "mlx-whisper unavailable — falling back to the CPU backend (still works)"
+  fi
+fi
+
 mkdir -p "$MURMUR_HOME/logs"
 ok "Config home ready at $MURMUR_HOME"
 
 # ── 3. Anthropic key (optional, for Haiku cleanup) ────────────────────────
 step "Haiku cleanup (optional)"
 
-say "  Murmur transcribes locally. It can optionally send the ${BOLD}text${RST} (never audio)"
-say "  to Claude Haiku for a fast grammar/filler cleanup pass."
-say "  ${DIM}Without a key it falls back to local rules — still good, just less polished.${RST}"
+say "  Murmur transcribes ${BOLD}entirely on your Mac${RST} — your audio never leaves it,"
+say "  with or without a key."
+say ""
+say "  Optionally, it can send the resulting ${BOLD}text${RST} (never the audio) to Claude"
+say "  Haiku to strip filler, fix punctuation and apply spoken corrections"
+say "  (\"Tuesday, no wait, Wednesday\" becomes \"Wednesday\"). It costs a fraction"
+say "  of a cent per dictation and uses ${BOLD}your own${RST} API key, billed to you."
+say ""
+say "  ${DIM}Get a key: https://console.anthropic.com/settings/keys${RST}"
+say "  ${DIM}Skip this and it uses local cleanup rules — good, just less polished.${RST}"
+say "  ${DIM}Stored in your macOS Keychain. Never written to disk or to the repo.${RST}"
 say ""
 
 if security find-generic-password -s murmur-anthropic -w >/dev/null 2>&1; then
@@ -173,12 +212,21 @@ fi
 # ── 5. Warm the model so the first dictation isn't slow ───────────────────
 step "Downloading the speech model"
 
-MODEL="$("$PY" -c 'from murmur.config import stt_model; print(stt_model())' 2>/dev/null || echo small.en)"
-say "  Fetching '$MODEL' (~500MB on first run, cached afterwards)…"
+BACKEND="$("$PY" -c 'from murmur.config import stt_backend; print(stt_backend())' 2>/dev/null || echo faster-whisper)"
+MODEL="$("$PY" -c 'from murmur.config import stt_model; print(stt_model())' 2>/dev/null || echo base.en)"
+say "  Backend: ${BOLD}$BACKEND${RST}  ·  model: ${BOLD}$MODEL${RST}"
+say "  ${DIM}Downloading once, then cached forever. This is the slow step.${RST}"
+# Backend-aware: the two engines take different model namespaces, so this
+# must go through the same resolution the daemon uses rather than assuming.
 if "$PY" - <<'PYEOF' 2>/dev/null
-from faster_whisper import WhisperModel
-from murmur.config import stt_model
-WhisperModel(stt_model(), device="cpu", compute_type="int8")
+from murmur.config import stt_backend, stt_model
+b, m = stt_backend(), stt_model()
+if b == "mlx-whisper":
+    import mlx_whisper, numpy as np
+    mlx_whisper.transcribe(np.zeros(16000, dtype="float32"), path_or_hf_repo=m)
+else:
+    from faster_whisper import WhisperModel
+    WhisperModel(m, device="cpu", compute_type="int8")
 PYEOF
 then
   ok "Model '$MODEL' cached and ready"
@@ -210,60 +258,77 @@ launchctl kickstart -k "gui/$UID/$LABEL" 2>/dev/null || true
 ok "Service started, and will start automatically at login"
 
 # ── 7. Permissions — the part people get stuck on ─────────────────────────
-step "Two permissions to grant by hand"
+step "Two permissions to grant (macOS requires you to do this by hand)"
 
-# Resolve through symlinks: TCC attributes to the real binary.
-TCC_BIN="$(python3 -c 'import os,sys;print(os.path.realpath(sys.argv[1]))' "$REAL_PY" 2>/dev/null || echo "$REAL_PY")"
+# TCC attributes trust to the REAL binary, so resolve symlinks — granting the
+# venv's symlinked python and then running the resolved one silently fails.
+TCC_BIN="$("$PY" -c 'import os,sys;print(os.path.realpath(sys.executable))' 2>/dev/null || echo "$REAL_PY")"
+printf '%s' "$TCC_BIN" | pbcopy 2>/dev/null || true
 
 cat <<EOF
 
   macOS will not let ${BOLD}any${RST} app read your keyboard or microphone without
-  explicit consent, and it cannot be scripted. Two grants, once:
+  explicit consent, and Apple deliberately makes it un-scriptable. Two grants,
+  once each, and you never think about it again.
 
-  ${BOLD}1. Microphone${RST}
-     The first time you hold Right Option, macOS shows a prompt. Click OK.
-     If you miss it: System Settings → Privacy & Security → Microphone.
+  ${BOLD}1. Accessibility${RST}  ${DIM}(to detect the hotkey and paste the text)${RST}
 
-  ${BOLD}2. Accessibility${RST}  ${DIM}(needed to detect the hotkey and paste)${RST}
-     System Settings → Privacy & Security → Accessibility → [ + ]
-     Press ${BOLD}Cmd-Shift-G${RST} in the file picker and paste exactly:
+     a. System Settings → Privacy & Security → ${BOLD}Accessibility${RST}
+     b. Click the ${BOLD}[ + ]${RST} button
+     c. Press ${BOLD}Cmd-Shift-G${RST}, paste this path (already on your clipboard):
 
-       ${BOLD}$TCC_BIN${RST}
+          ${BOLD}$TCC_BIN${RST}
 
-     Then make sure its toggle is ${BOLD}on${RST}.
+     d. Click Open, then make sure the toggle next to it is ${BOLD}ON${RST}
 
-  ${DIM}This path is on your clipboard now.${RST}
+  ${BOLD}2. Microphone${RST}
+     The first time you hold Right Option, macOS asks. Click OK.
+     ${DIM}(Or pre-grant it: System Settings → Privacy & Security → Microphone)${RST}
+
 EOF
 
-printf '%s' "$TCC_BIN" | pbcopy 2>/dev/null || true
-
-# ── 8. Verify ─────────────────────────────────────────────────────────────
-step "Checking it came up"
-sleep 3
-
-if launchctl print "gui/$UID/$LABEL" >/dev/null 2>&1; then
-  PID="$(launchctl print "gui/$UID/$LABEL" 2>/dev/null | awk '/^\tpid = /{print $3}')"
-  if [[ -n "${PID:-}" ]]; then
-    ok "Murmur is running (pid $PID)"
-  else
-    warn "Registered but not running yet — usually means Accessibility isn't granted."
-    say  "     Grant it above, then run:  launchctl kickstart -k gui/$UID/$LABEL"
+if [[ -t 0 ]]; then
+  say "  I'll open Accessibility settings for you."
+  printf '  Press Enter when you have granted it (or type s to skip)… '
+  read -r GRANTED || true
+  if [[ "${GRANTED:-}" != "s" ]]; then
+    open "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility" 2>/dev/null || true
+    printf '  Press Enter once the toggle is on… '
+    read -r _ || true
   fi
-else
-  warn "Service didn't register. See $MURMUR_HOME/logs/daemon.err.log"
 fi
 
-cat <<EOF
+# ── 8. Verify — assert the capability, not just the PID ───────────────────
+# A daemon can hold a healthy PID while its hotkey listener is dead, so
+# "is it running?" is not a sufficient check. Hand off to doctor, which
+# tests Accessibility, the microphone, the model and the key for real.
+step "Checking everything actually works"
+launchctl kickstart -k "gui/$UID/$LABEL" 2>/dev/null || true
+sleep 4
 
-  ${GRN}${BOLD}Done.${RST}
+set +e
+"$PY" -m murmur doctor
+DOCTOR_RC=$?
+set -e
+
+cat <<EOF
 
   ${BOLD}Use it:${RST}   Hold ${BOLD}Right Option${RST}, speak, release. Text pastes at your cursor.
             Double-tap Right Option for hands-free; tap once to stop.
 
-  ${BOLD}Logs:${RST}     tail -f $MURMUR_HOME/logs/daemon.err.log
-  ${BOLD}Restart:${RST}  launchctl kickstart -k gui/$UID/$LABEL
-  ${BOLD}Remove:${RST}   ./install/uninstall.sh
+  ${BOLD}If anything misbehaves, run this first:${RST}
+            ${BOLD}$PY -m murmur doctor${RST}
+            It names the problem and prints the exact fix.
 
-  No terminal needed from here on.
+  ${BOLD}Add an API key later:${RST}  $PY -m murmur set-key
+  ${BOLD}Restart:${RST}              $PY -m murmur restart
+  ${BOLD}Remove completely:${RST}    ./install/uninstall.sh
 
 EOF
+
+if (( DOCTOR_RC != 0 )); then
+  warn "Some checks failed above — fix those and re-run doctor."
+  say  "     Most often this is just Accessibility not toggled on yet."
+else
+  printf '  %s%sAll set. No terminal needed from here on.%s\n\n' "$GRN" "$BOLD" "$RST"
+fi

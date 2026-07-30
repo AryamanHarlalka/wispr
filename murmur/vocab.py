@@ -51,10 +51,19 @@ def _frontmatter_aliases(text: str) -> list[str]:
     return [a.strip().strip("'\"") for a in m.group(1).split(",") if a.strip()]
 
 
-def generate(vault: Path = VAULT) -> list[str]:
+def generate(vault: Path | None = None) -> list[str]:
+    """Seed terms + local personal seeds + (optionally) proper nouns
+    harvested from an Obsidian vault. `vault=None` means no vault is
+    configured — the common case on a fresh install for someone who
+    doesn't use Obsidian — and is not an error."""
+    if vault is None:
+        vault = VAULT
     terms: dict[str, None] = {t: None for t in SEED_TERMS}
     for t in _personal_seeds():
         terms.setdefault(t, None)
+    if vault is None or not Path(vault).is_dir():
+        return list(terms.keys())
+    vault = Path(vault)
 
     def add(t: str) -> None:
         t = t.strip()
@@ -87,7 +96,7 @@ def generate(vault: Path = VAULT) -> list[str]:
     return list(terms.keys())
 
 
-def write_vocab(vault: Path = VAULT) -> Path:
+def write_vocab(vault: Path | None = None) -> Path:
     ensure_home()
     out = MURMUR_HOME / "vocab.txt"
     out.write_text("\n".join(generate(vault)) + "\n")

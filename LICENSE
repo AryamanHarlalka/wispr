@@ -1,0 +1,46 @@
+MIT License
+
+Copyright (c) 2026 Wispr contributors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+---
+
+## Third-party components
+
+Murmur installs and calls the following at runtime. Their licences apply to
+them, not to Murmur, and none of their code is vendored into this repository.
+
+- **faster-whisper** (MIT) and **CTranslate2** (MIT) — CPU transcription.
+- **mlx-whisper** (MIT) — Apple Silicon GPU transcription.
+- **OpenAI Whisper models** (MIT) — the speech models themselves, downloaded
+  on first run.
+- **whisper.cpp / ggml** (MIT) — optional alternative backend. If you
+  distribute the ggml model files under `bench/models/`, the MIT attribution
+  requirement travels with them.
+- **pynput** (LGPL-3.0) — global hotkey capture. Used as an unmodified
+  library via its public API; not linked statically, not modified.
+- **sounddevice** (MIT) and **PortAudio** (MIT) — audio capture.
+- **pyobjc** (MIT) — macOS system integration.
+- **anthropic** (MIT) — optional cleanup client.
+- **rumps** (BSD-3-Clause) — optional menu-bar companion.
+
+Speech audio is processed entirely on the local machine. When an Anthropic API
+key is configured, transcribed **text** — never audio — is sent to the
+Anthropic API under that key holder's own account and terms.
