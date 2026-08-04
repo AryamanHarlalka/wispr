@@ -1,4 +1,4 @@
-"""~/.murmur/ config home: modes, snippets, vocab, corrections, history."""
+"""~/.wispr/ config home: modes, snippets, vocab, corrections, history."""
 from __future__ import annotations
 
 import os
@@ -11,7 +11,7 @@ if sys.version_info >= (3, 11):
 else:  # pragma: no cover
     import tomli as tomllib
 
-MURMUR_HOME = Path(os.environ.get("MURMUR_HOME", Path.home() / ".murmur"))
+WISPR_HOME = Path(os.environ.get("WISPR_HOME", Path.home() / ".wispr"))
 
 
 def _default_vault() -> Path | None:
@@ -19,13 +19,13 @@ def _default_vault() -> Path | None:
     STT prompt (see vocab.py). There is deliberately NO built-in default:
     this file ships to other people, so a hardcoded personal path would be
     both wrong for them and a privacy leak. Resolution order:
-    MURMUR_VAULT env -> ~/.murmur/vault-path (written by the installer) ->
+    WISPR_VAULT env -> ~/.wispr/vault-path (written by the installer) ->
     None, meaning 'no vault, use the built-in seed terms'."""
-    env = os.environ.get("MURMUR_VAULT", "").strip()
+    env = os.environ.get("WISPR_VAULT", "").strip()
     if env:
         return Path(env).expanduser()
     try:
-        p = MURMUR_HOME / "vault-path"
+        p = WISPR_HOME / "vault-path"
         if p.exists():
             line = p.read_text().strip().splitlines()
             if line and line[0].strip():
@@ -38,7 +38,7 @@ def _default_vault() -> Path | None:
 VAULT = _default_vault()
 
 DEFAULT_MODES = """\
-# Murmur app-aware modes (F2). bundle id prefix -> mode.
+# Wispr app-aware modes (F2). bundle id prefix -> mode.
 # modes: casual | email | technical | neutral
 [modes]
 "com.tinyspeck.slackmacgap" = "casual"
@@ -54,10 +54,10 @@ default = "neutral"
 """
 
 # NOTE: shipped defaults must stay impersonal — this file is public and this
-# template is written verbatim into a new user's ~/.murmur/snippets.toml on
+# template is written verbatim into a new user's ~/.wispr/snippets.toml on
 # first run. Personal snippets live only in that local file, never here.
 DEFAULT_SNIPPETS = """\
-# Murmur snippets (F5): spoken trigger -> inserted block.
+# Wispr snippets (F5): spoken trigger -> inserted block.
 # Edit freely — this file is yours and is never committed or uploaded.
 [snippets]
 # "my email"      = "you@example.com"
@@ -89,33 +89,33 @@ STYLE_BLOCKS = {
 
 
 def ensure_home() -> None:
-    MURMUR_HOME.mkdir(parents=True, exist_ok=True)
-    modes = MURMUR_HOME / "modes.toml"
+    WISPR_HOME.mkdir(parents=True, exist_ok=True)
+    modes = WISPR_HOME / "modes.toml"
     if not modes.exists():
         modes.write_text(DEFAULT_MODES)
-    snippets = MURMUR_HOME / "snippets.toml"
+    snippets = WISPR_HOME / "snippets.toml"
     if not snippets.exists():
         snippets.write_text(DEFAULT_SNIPPETS)
-    (MURMUR_HOME / "corrections.tsv").touch()
-    (MURMUR_HOME / "history.jsonl").touch()
+    (WISPR_HOME / "corrections.tsv").touch()
+    (WISPR_HOME / "history.jsonl").touch()
 
 
 def load_modes() -> dict[str, str]:
     ensure_home()
-    with open(MURMUR_HOME / "modes.toml", "rb") as f:
+    with open(WISPR_HOME / "modes.toml", "rb") as f:
         return tomllib.load(f).get("modes", {})
 
 
 def load_snippets() -> dict[str, str]:
     ensure_home()
-    with open(MURMUR_HOME / "snippets.toml", "rb") as f:
+    with open(WISPR_HOME / "snippets.toml", "rb") as f:
         return tomllib.load(f).get("snippets", {})
 
 
 def load_corrections() -> dict[str, str]:
     ensure_home()
     out: dict[str, str] = {}
-    for line in (MURMUR_HOME / "corrections.tsv").read_text().splitlines():
+    for line in (WISPR_HOME / "corrections.tsv").read_text().splitlines():
         if "\t" in line:
             wrong, right = line.split("\t", 1)
             out[wrong.strip()] = right.strip()
@@ -124,13 +124,13 @@ def load_corrections() -> dict[str, str]:
 
 def add_correction(wrong: str, right: str) -> None:
     ensure_home()
-    with open(MURMUR_HOME / "corrections.tsv", "a") as f:
+    with open(WISPR_HOME / "corrections.tsv", "a") as f:
         f.write(f"{wrong}\t{right}\n")
 
 
 def load_vocab() -> list[str]:
     ensure_home()
-    p = MURMUR_HOME / "vocab.txt"
+    p = WISPR_HOME / "vocab.txt"
     if not p.exists():
         return []
     return [w.strip() for w in p.read_text().splitlines() if w.strip()]
@@ -140,8 +140,8 @@ DEFAULT_WHISPER_MODEL = "base.en"
 
 
 def whisper_model() -> str:
-    """Whisper model knob (B2). Priority: MURMUR_WHISPER_MODEL env ->
-    ~/.murmur/whisper-model (first line) -> base.en.
+    """Whisper model knob (B2). Priority: WISPR_WHISPER_MODEL env ->
+    ~/.wispr/whisper-model (first line) -> base.en.
 
     Benchmarked 2026-07-16 (synthetic say-generated audio, isolated):
     distil-small.en was 2-8x slower than small.en on this CPU and
@@ -157,12 +157,12 @@ def whisper_model() -> str:
     120 real dictations) and this is the single biggest lever available on
     Intel hardware, where no GPU backend exists.
 
-    Revert with:  echo small.en > ~/.murmur/whisper-model
+    Revert with:  echo small.en > ~/.wispr/whisper-model
     """
-    env = os.environ.get("MURMUR_WHISPER_MODEL", "").strip()
+    env = os.environ.get("WISPR_WHISPER_MODEL", "").strip()
     if env:
         return env
-    p = MURMUR_HOME / "whisper-model"
+    p = WISPR_HOME / "whisper-model"
     try:
         if p.exists():
             name = p.read_text().strip().splitlines()[0].strip()
@@ -174,10 +174,10 @@ def whisper_model() -> str:
 
 
 def load_config() -> dict:
-    """~/.murmur/config.toml — general knobs (currently: [stt]). Missing file
+    """~/.wispr/config.toml — general knobs (currently: [stt]). Missing file
     or missing keys just fall through to caller defaults."""
     ensure_home()
-    p = MURMUR_HOME / "config.toml"
+    p = WISPR_HOME / "config.toml"
     if not p.exists():
         return {}
     try:
@@ -230,11 +230,11 @@ def resolve_backend() -> str:
 
 
 def stt_backend() -> str:
-    """STT backend knob (0c). Priority: MURMUR_STT_BACKEND env ->
-    ~/.murmur/config.toml [stt].backend -> auto-detect (resolve_backend()).
+    """STT backend knob (0c). Priority: WISPR_STT_BACKEND env ->
+    ~/.wispr/config.toml [stt].backend -> auto-detect (resolve_backend()).
     An explicit value always wins, so a user can pin a backend for
     debugging; "auto" re-detects per machine."""
-    env = os.environ.get("MURMUR_STT_BACKEND", "").strip()
+    env = os.environ.get("WISPR_STT_BACKEND", "").strip()
     if env and env != "auto":
         return env
     if not env:
@@ -250,8 +250,8 @@ DEFAULT_STT_BEAM_SIZE = 1
 def stt_beam_size() -> int:
     """Beam size knob (0d): 1 trades a little accuracy for materially
     faster decode; 5 (faster-whisper's own default) is slower. Priority:
-    MURMUR_STT_BEAM_SIZE env -> ~/.murmur/config.toml [stt].beam_size -> 1."""
-    env = os.environ.get("MURMUR_STT_BEAM_SIZE", "").strip()
+    WISPR_STT_BEAM_SIZE env -> ~/.wispr/config.toml [stt].beam_size -> 1."""
+    env = os.environ.get("WISPR_STT_BEAM_SIZE", "").strip()
     if env:
         try:
             return int(env)
@@ -264,15 +264,15 @@ def stt_beam_size() -> int:
 
 
 def stt_model() -> str:
-    """STT model knob (0c/B2). Priority: MURMUR_STT_MODEL env ->
-    ~/.murmur/config.toml [stt].model -> backend-appropriate default.
+    """STT model knob (0c/B2). Priority: WISPR_STT_MODEL env ->
+    ~/.wispr/config.toml [stt].model -> backend-appropriate default.
 
     The default is backend-dependent because the naming schemes differ:
     faster-whisper takes a short model id ("base.en"), mlx-whisper takes an
     HF repo ("mlx-community/whisper-large-v3-turbo"). Handing a base.en
     string to MLX would fail, so 'auto' picks the matching default rather
     than assuming one namespace."""
-    env = os.environ.get("MURMUR_STT_MODEL", "").strip()
+    env = os.environ.get("WISPR_STT_MODEL", "").strip()
     if env:
         return env
     v = load_config().get("stt", {}).get("model", "").strip()
@@ -308,6 +308,25 @@ def _float_knob(env_name: str, section: str, key: str, default: float) -> float:
     return default
 
 
+def hotkey() -> str:
+    """Which key starts a dictation: "right_option" (default) or "fn".
+
+    Fn cannot go through pynput -- macOS delivers the globe key only as a
+    modifier bit on flagsChanged, never as a key event -- so the daemon
+    switches to a Quartz tap when this is set. Choosing "fn" also requires
+    System Settings -> Keyboard -> "Press globe key to" = "Do Nothing",
+    since a listen-only tap leaves the system behaviour running.
+
+        [hotkey]
+        key = "fn"
+    """
+    env = os.environ.get("WISPR_HOTKEY", "").strip().lower()
+    v = env or load_config().get("hotkey", {}).get("key")
+    if isinstance(v, str) and v.strip().lower() in ("fn", "globe"):
+        return "fn"
+    return "right_option"
+
+
 def paste_instant() -> bool:
     """Instant-paste mode (2026-07-30). ON by default.
 
@@ -322,42 +341,57 @@ def paste_instant() -> bool:
     something better (see paste_revise). Perceived latency drops by the
     whole cleanup step.
 
-    Disable with [paste] instant = false in ~/.murmur/config.toml."""
-    return _bool_knob("MURMUR_PASTE_INSTANT", "paste", "instant", True)
+    Disable with [paste] instant = false in ~/.wispr/config.toml."""
+    return _bool_knob("WISPR_PASTE_INSTANT", "paste", "instant", True)
 
 
 def paste_revise() -> bool:
     """Whether instant mode is allowed to rewrite what it pasted once Haiku
-    returns. ON by default; set false to keep the fast paste but never touch
-    the text again (rules output only, permanently).
+    returns. OFF by default since 2026-08-04; set true to opt back in.
 
     The revision deletes exactly the characters it pasted and re-pastes the
     improved text. It is heavily guarded (same app still frontmost, no new
-    dictation started, within the window, text short enough) because those
-    keystrokes go into a live document."""
-    return _bool_knob("MURMUR_PASTE_REVISE", "paste", "revise", True)
+    dictation started, within the window, text short enough, replacement
+    staged on the clipboard before anything is deleted) because those
+    keystrokes go into a live document.
+
+    It used to default to ON, and that is the setting that produced the
+    "text appears, then vanishes" incident: the retraction ran before the
+    replacement was available, and a clipboard-restore thread overwrote
+    the only remaining copy. Both of those are fixed (see
+    daemon._revise_in_place), but one assumption cannot be fixed from
+    here: the retraction still sends one backspace per character it
+    believes it pasted. If the target app silently autocorrected a word,
+    the count is wrong and the extra backspaces eat text that was never
+    ours. That residual risk buys a slightly tidier sentence, so the
+    default is now no. Turn it on with:
+
+        [paste]
+        revise = true
+    """
+    return _bool_knob("WISPR_PASTE_REVISE", "paste", "revise", False)
 
 
 def revise_window_s() -> float:
     """How long after the instant paste a revision may still land. Past
     this the user has probably started typing and rewriting under them is
     worse than leaving slightly rougher text."""
-    return _float_knob("MURMUR_REVISE_WINDOW_S", "paste", "revise_window_s", 2.5)
+    return _float_knob("WISPR_REVISE_WINDOW_S", "paste", "revise_window_s", 2.5)
 
 
 def revise_max_chars() -> int:
     """Skip revision above this length. The revision deletes by sending one
     backspace per character; past a few hundred that is both slow and more
     exposure than the improvement is worth."""
-    v = _float_knob("MURMUR_REVISE_MAX_CHARS", "paste", "revise_max_chars", 1200)
+    v = _float_knob("WISPR_REVISE_MAX_CHARS", "paste", "revise_max_chars", 1200)
     return int(v)
 
 
-KEYCHAIN_SERVICE = "murmur-anthropic"
+KEYCHAIN_SERVICE = "wispr-anthropic"
 
 
 def anthropic_key() -> str | None:
-    """Env first, then macOS keychain item 'murmur-anthropic'."""
+    """Env first, then macOS keychain item 'wispr-anthropic'."""
     key = os.environ.get("ANTHROPIC_API_KEY")
     if key:
         return key
@@ -381,7 +415,7 @@ def set_anthropic_key(key: str) -> None:
         raise ValueError("empty key")
     subprocess.run(
         ["security", "add-generic-password", "-U",
-         "-s", KEYCHAIN_SERVICE, "-a", os.environ.get("USER", "murmur"),
+         "-s", KEYCHAIN_SERVICE, "-a", os.environ.get("USER", "wispr"),
          "-w", key],
         check=True, capture_output=True, text=True,
     )

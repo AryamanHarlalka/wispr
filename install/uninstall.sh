@@ -1,17 +1,19 @@
 #!/usr/bin/env bash
 #
-# Removes the Murmur background service.
-# Leaves ~/.murmur (your config, vocab, history) alone unless you pass --purge.
+# Removes the Wispr background service.
+# Leaves ~/.wispr (your config, vocab, history) alone unless you pass --purge.
 set -euo pipefail
 
-LABEL="com.murmur.daemon"
+LABEL="com.wispr.daemon"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
-MURMUR_HOME="${MURMUR_HOME:-$HOME/.murmur}"
+WISPR_HOME="${WISPR_HOME:-$HOME/.wispr}"
 
-echo "==> Stopping Murmur"
-# Remove EVERY murmur/wispr agent, not just the current label: older installs
+echo "==> Stopping Wispr"
+# Remove EVERY com.wispr.* agent, not just the current label: older installs
 # left differently-named plists behind, and a leftover one silently starts a
 # second daemon that fights the first for the microphone.
+# The glob is deliberately anchored to com.wispr.* -- a bare '*wispr*' would
+# also match the unrelated Wispr Flow app's com.electron.wispr-flow jobs.
 REMOVED=0
 while IFS= read -r f; do
   [[ -z "$f" ]] && continue
@@ -22,19 +24,20 @@ while IFS= read -r f; do
   echo "  ✓ Removed $lbl"
   REMOVED=$((REMOVED + 1))
 done < <(find "$HOME/Library/LaunchAgents" -maxdepth 1 \
-              \( -iname '*murmur*.plist' -o -iname '*wispr*.plist' \) 2>/dev/null)
-(( REMOVED )) || echo "  · No Murmur LaunchAgent was installed"
+              -iname 'com.wispr.*.plist' 2>/dev/null)
+(( REMOVED )) || echo "  · No Wispr LaunchAgent was installed"
 
 if [[ "${1:-}" == "--purge" ]]; then
-  rm -rf "$MURMUR_HOME"
-  security delete-generic-password -s murmur-anthropic >/dev/null 2>&1 || true
-  echo "  ✓ Purged $MURMUR_HOME and removed the keychain entry"
+  rm -rf "$WISPR_HOME"
+  security delete-generic-password -s wispr-anthropic >/dev/null 2>&1 || true
+  echo "  ✓ Purged $WISPR_HOME and removed the keychain entry"
 else
-  echo "  · Kept $MURMUR_HOME (config, vocab, history)"
+  echo "  · Kept $WISPR_HOME (config, vocab, history)"
   echo "    Pass --purge to delete it and the keychain entry too."
 fi
 
 echo
-echo "  Note: macOS keeps the Accessibility entry for the old Python binary."
-echo "  Remove it by hand in System Settings → Privacy & Security → Accessibility."
+echo "  Note: macOS keeps the Accessibility and Microphone entries for"
+echo "  ~/Applications/Wispr.app. Remove them by hand in"
+echo "  System Settings → Privacy & Security → Accessibility / Microphone."
 echo

@@ -21,5 +21,8 @@ bench/dumps/
 # Runtime state / secrets
 .env
 .env.local
-~/.murmur/
+~/.wispr/
 *.log
+
+# App bundle built by install/build-app.sh (goes to ~/Applications).
+build/

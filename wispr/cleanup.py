@@ -227,7 +227,7 @@ def await_revision(fut, timeout: float) -> tuple[str | None, str]:
     try:
         out = fut.result(timeout=timeout)
     except Exception as e:
-        print(f"[murmur] revision skipped ({_fallback_reason(e)})", flush=True)
+        print(f"[wispr] revision skipped ({_fallback_reason(e)})", flush=True)
         return None, "rules"
     out = (out or "").strip()
     if not out:
@@ -255,6 +255,6 @@ def clean_text(transcript: str, mode: str, vocab: list[str],
         return fut.result(timeout=HAIKU_BUDGET_S), "haiku"
     except Exception as e:
         fut.cancel()  # no-op if already running; see module docstring
-        print(f"[murmur] cleanup fallback -> rules ({_fallback_reason(e)})",
+        print(f"[wispr] cleanup fallback -> rules ({_fallback_reason(e)})",
               flush=True)
         return rules.clean(transcript, corrections), "fallback"

@@ -1,4 +1,4 @@
-# Murmur
+# Wispr
 
 Local voice dictation for macOS. Hold **Right Option**, speak, release — clean
 text appears wherever your cursor is. Works in any app.
@@ -13,8 +13,8 @@ hardware, so there's no subscription, no per-word cost, and nothing to trust.
 You need a Mac. Everything else the installer handles.
 
 ```bash
-git clone https://github.com/your-username/murmur.git ~/code/murmur
-cd ~/code/murmur && ./install/install.sh
+git clone https://github.com/your-username/wispr.git ~/code/wispr
+cd ~/code/wispr && ./install/install.sh
 ```
 
 It takes about five minutes, most of it downloading the speech model. The
@@ -49,7 +49,7 @@ consent, and Apple deliberately makes this un-scriptable. So this is the one
 part you do by hand. The installer walks you through it and puts the path you
 need on your clipboard.
 
-**Accessibility** — lets Murmur notice you're holding the hotkey, and paste the
+**Accessibility** — lets Wispr notice you're holding the hotkey, and paste the
 result. System Settings → Privacy & Security → Accessibility → **[+]** → press
 `Cmd-Shift-G` → paste the path → toggle it **on**.
 
@@ -57,13 +57,13 @@ result. System Settings → Privacy & Security → Accessibility → **[+]** →
 
 > The path must be the *real* Python binary, not a symlink — macOS attributes
 > permissions to the resolved file. The installer resolves it for you; if you're
-> doing it by hand, `murmur doctor` prints the exact path to use.
+> doing it by hand, `wispr doctor` prints the exact path to use.
 
 ---
 
 ## The API key (optional)
 
-Murmur always transcribes locally. A key only affects the **cleanup** step:
+Wispr always transcribes locally. A key only affects the **cleanup** step:
 
 | | Without a key | With a key |
 |---|---|---|
@@ -79,8 +79,8 @@ The key is **yours** — get one at
 stored in your macOS Keychain, never on disk and never in this repo.
 
 ```bash
-murmur set-key            # add or replace
-murmur set-key --clear    # remove; falls back to local rules
+wispr set-key            # add or replace
+wispr set-key --clear    # remove; falls back to local rules
 ```
 
 Only the transcribed **text** is ever sent, and only when a key is present.
@@ -93,10 +93,10 @@ Only the transcribed **text** is ever sent, and only when a key is present.
 |---|---|
 | **Dictate** | Hold Right Option, speak, release |
 | **Hands-free** | Double-tap Right Option; tap once to stop |
-| **Fix a word it keeps mishearing** | `murmur fix "wrong" "right"` |
-| **See recent dictations** | `murmur history` |
-| **Check what's wrong** | `murmur doctor` |
-| **Restart it** | `murmur restart` |
+| **Fix a word it keeps mishearing** | `wispr fix "wrong" "right"` |
+| **See recent dictations** | `wispr history` |
+| **Check what's wrong** | `wispr doctor` |
+| **Restart it** | `wispr restart` |
 
 Text appears almost immediately — the local result pastes right away, then
 quietly refines itself a moment later if the cleanup pass improves on it. You
@@ -106,7 +106,7 @@ and terminals, where auto-indent and autocomplete make rewriting unsafe.
 Prefer the text to land once and never change?
 
 ```toml
-# ~/.murmur/config.toml
+# ~/.wispr/config.toml
 [paste]
 revise = false
 ```
@@ -115,7 +115,7 @@ revise = false
 
 ## Making it yours
 
-Everything personal lives in `~/.murmur/`, outside this repo, and is never
+Everything personal lives in `~/.wispr/`, outside this repo, and is never
 committed or uploaded.
 
 | File | What it does |
@@ -127,11 +127,11 @@ committed or uploaded.
 | `modes.toml` | per-app tone — casual in Slack, precise in editors |
 | `history.jsonl` | every dictation, local only |
 
-**Obsidian users:** point Murmur at your vault and it learns the proper nouns
+**Obsidian users:** point Wispr at your vault and it learns the proper nouns
 you actually use, so it stops mangling names.
 
 ```bash
-echo "/path/to/your/vault" > ~/.murmur/vault-path && murmur vocab
+echo "/path/to/your/vault" > ~/.wispr/vault-path && wispr vocab
 ```
 
 Only names are extracted — page titles, aliases, folder names. Never note
@@ -142,14 +142,14 @@ content.
 ## When something breaks
 
 ```bash
-murmur doctor
+wispr doctor
 ```
 
 It checks for duplicate daemons, a dead hotkey listener, missing permissions, a
 wedged microphone, a broken model and an invalid key — and prints the exact
 command to fix whatever it finds. Start here; it usually saves the debugging.
 
-Logs, if you want them: `~/.murmur/logs/daemon.err.log`
+Logs, if you want them: `~/.wispr/logs/daemon.err.log`
 
 ### Uninstall
 

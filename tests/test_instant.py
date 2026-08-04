@@ -4,15 +4,29 @@ These assert the SAFE behaviour: that a revision refuses to fire whenever
 it cannot prove it owns the cursor. A false negative costs slightly rougher
 text; a false positive deletes the user's own characters.
 """
+import os
 import sys
 import threading
 import time
 import types
 
-import murmur.cleanup as cleanup
-import murmur.daemon as d
+# Same reasoning as test_doubletap: never read or write real user state.
+os.environ.setdefault("WISPR_HOTKEY", "right_option")
+os.environ.setdefault("WISPR_HOME", "/tmp/wispr-test-home")
+
+import wispr.cleanup as cleanup
+import wispr.daemon as d
+import wispr.history as history
 
 FAILS = []
+
+# Do NOT write to the real ~/.wispr/history.jsonl. _revise_in_place() calls
+# history.append() on the happy path, and an earlier version of this file let
+# that through -- writing fake dictations into the user's actual history.
+# A test that touches live user data is a bug in the test.
+_history_writes = []
+history.append = lambda *a, **k: _history_writes.append(a)
+d.history = history
 
 
 def check(name, cond):
@@ -59,6 +73,17 @@ sent = {"backspaces": 0, "pasted": []}
 d._send_backspaces = lambda n: sent.__setitem__("backspaces", sent["backspaces"] + n)
 d.paste_text = lambda text, app=None: sent["pasted"].append(text)
 d._frontmost_pid = lambda: 4242  # same app still frontmost by default
+# 2026-08-04: the revision now stages the replacement on the clipboard
+# before it deletes anything, and re-asserts focus first. Both are real
+# system calls, so stub them for the same reason history.append is stubbed
+# above -- an unstubbed run would rewrite the user's actual clipboard.
+d._pasteboard_read = lambda: None
+d._pasteboard_write = lambda text: None
+d._activate_target = lambda app=None: None
+# paste.revise now defaults to OFF (see config.paste_revise). These tests
+# are about what the revision does when it is enabled, so state that here
+# instead of inheriting whatever the user's config happens to say.
+d.paste_revise = lambda: True
 
 
 print("\n1. instant_result splits correctly")
@@ -153,6 +178,20 @@ dm._revise_in_place(done_future("improved"), base, FakeApp(),
                     "com.apple.Notes", "neutral", "raw", time.time())
 check("recording again -> does NOT revise",
       sent["backspaces"] == 0 and sent["pasted"] == [])
+
+print("\n4. the tests themselves stayed out of real user data")
+check("history.append was stubbed, not live", len(_history_writes) >= 1)
+import pathlib, json
+_real = pathlib.Path.home() / ".wispr" / "history.jsonl"
+_polluted = 0
+if _real.exists():
+    for _ln in _real.read_text(errors="ignore").splitlines():
+        try:
+            if json.loads(_ln).get("cleaned") == "the improved version":
+                _polluted += 1
+        except Exception:
+            pass
+check("no test fixtures leaked into ~/.wispr/history.jsonl", _polluted == 0)
 
 print()
 if FAILS:

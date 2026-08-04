@@ -1,4 +1,4 @@
-"""F3 — vault vocab pipeline. Reads the brain, emits ~/.murmur/vocab.txt.
+"""F3 — vault vocab pipeline. Reads the brain, emits ~/.wispr/vocab.txt.
 
 Guardrail (spec F3): TERMS ONLY — names, companies, project slugs, domain
 words. Never facts, never note content. This is the only brain-derived
@@ -9,11 +9,11 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from .config import MURMUR_HOME, VAULT, ensure_home
+from .config import WISPR_HOME, VAULT, ensure_home
 
 # Shipped seeds are generic tooling terms only. Personal seeds — people's
 # names, private project codenames, employers — must NOT live in this file:
-# it is committed and shared. Put those in ~/.murmur/seed-terms.txt (one per
+# it is committed and shared. Put those in ~/.wispr/seed-terms.txt (one per
 # line), which is local-only and never leaves the machine.
 SEED_TERMS = [
     "Whisper", "WhisperX", "Anthropic", "Claude", "Haiku", "Sonnet", "Opus",
@@ -24,9 +24,9 @@ SEED_TERMS = [
 
 
 def _personal_seeds() -> list[str]:
-    """Local-only seed terms from ~/.murmur/seed-terms.txt (one per line,
+    """Local-only seed terms from ~/.wispr/seed-terms.txt (one per line,
     '#' comments allowed). Absent on a fresh install — that's fine."""
-    p = MURMUR_HOME / "seed-terms.txt"
+    p = WISPR_HOME / "seed-terms.txt"
     if not p.exists():
         return []
     try:
@@ -98,7 +98,7 @@ def generate(vault: Path | None = None) -> list[str]:
 
 def write_vocab(vault: Path | None = None) -> Path:
     ensure_home()
-    out = MURMUR_HOME / "vocab.txt"
+    out = WISPR_HOME / "vocab.txt"
     out.write_text("\n".join(generate(vault)) + "\n")
     return out
 

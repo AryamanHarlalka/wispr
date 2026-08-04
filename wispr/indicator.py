@@ -3,9 +3,10 @@ menu-bar companion. Five states: listening / transcribing / cleaning /
 pasted / error. The v2 lesson: invisible feedback reads as broken — the
 pill sits bottom-center, always-on-top, and every state looks different.
 
-B6 (visual rework): the pill is now a Wispr-Flow-style stadium capsule
-drawn on a single canvas. Design target observed from Wispr's *public*
-homepage hero animation (wisprflow.ai): a capsule pill whose recording
+B6 (visual rework): the pill is now a stadium capsule styled after
+Wispr Flow (the unrelated commercial dictation app, no relation to this
+project), drawn on a single canvas. Design target observed from Wispr
+Flow's *public* homepage hero animation (wisprflow.ai): a capsule pill whose recording
 state is a row of ~20 thin, round-capped bars where quiet bars collapse
 into dots (min height == bar width), heights easing smoothly instead of
 snapping. Values here are our own; only the look was matched by eye.
@@ -18,7 +19,7 @@ Rendering details:
   where that isn't available we fall back to a solid near-black window
   (square corners, dark-on-dark, still presentable).
 - Bars are round-capped `create_line`s too, so a zero-height bar is a
-  dot — the signature Wispr idle look.
+  dot — the signature Wispr Flow idle look.
 - A 33 ms frame loop eases displayed bar heights toward their targets
   (fast attack, slow release) and eases the pill's width when the
   content changes, so state changes morph instead of jumping.
@@ -38,9 +39,9 @@ import queue
 import threading
 import time
 
-from .config import MURMUR_HOME, ensure_home
+from .config import WISPR_HOME, ensure_home
 
-STATE_FILE = MURMUR_HOME / "state.json"
+STATE_FILE = WISPR_HOME / "state.json"
 
 # --- palette (ours; Apple-system-adjacent accents) ---
 PILL_BG = "#161616"
@@ -357,7 +358,7 @@ class Indicator:
                     continue
                 color, text = COLORS.get(state, ("#888888", state))
                 if state == "listening" and not detail:
-                    text = ""  # Wispr look: recording is waveform-only
+                    text = ""  # Wispr Flow look: recording is waveform-only
                 elif detail:
                     text = f"{text} · {detail}"
                 self._text = text

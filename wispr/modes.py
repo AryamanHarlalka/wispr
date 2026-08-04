@@ -6,10 +6,10 @@ def frontmost_app():
     """Returns the live NSRunningApplication, not just its bundle id.
 
     Callers must grab this the instant the hotkey is pressed, before any
-    Murmur UI shows — the floating pill activating itself (confirmed via
+    Wispr UI shows — the floating pill activating itself (confirmed via
     history.jsonl logging "org.python.python" as frontmost on every
     dictation) means querying frontmost *after* recording/processing always
-    returns Murmur itself, not the app the user was actually dictating into.
+    returns Wispr itself, not the app the user was actually dictating into.
     The daemon re-activates this exact object right before sending the paste
     keystroke, which is what actually fixes where the text lands.
     """

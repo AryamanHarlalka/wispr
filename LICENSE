@@ -24,8 +24,8 @@ SOFTWARE.
 
 ## Third-party components
 
-Murmur installs and calls the following at runtime. Their licences apply to
-them, not to Murmur, and none of their code is vendored into this repository.
+Wispr installs and calls the following at runtime. Their licences apply to
+them, not to Wispr, and none of their code is vendored into this repository.
 
 - **faster-whisper** (MIT) and **CTranslate2** (MIT) — CPU transcription.
 - **mlx-whisper** (MIT) — Apple Silicon GPU transcription.

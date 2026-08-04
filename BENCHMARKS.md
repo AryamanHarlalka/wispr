@@ -1,4 +1,4 @@
-# Murmur — latency and accuracy measurements
+# Wispr — latency and accuracy measurements
 
 Last run: **2026-07-30**, macOS 15.7.7, Intel x86_64 (i5-1038NG7, Iris Plus iGPU),
 faster-whisper via CTranslate2 int8, `beam_size=1`.
@@ -29,7 +29,7 @@ wrong, and the vocab + corrections layers are what actually fix that class of
 error. Given latency was the dominant real-use complaint and the speedup is
 2–3×, `base.en` is the correct default on this hardware.
 
-Revert in one line: `echo small.en > ~/.murmur/whisper-model && murmur restart`
+Revert in one line: `echo small.en > ~/.wispr/whisper-model && wispr restart`
 
 **Change 2 — cleanup moved off the paste's critical path.** Previously nothing
 appeared on screen until Haiku answered or its 2.5 s budget expired; 18% of
@@ -59,7 +59,7 @@ until then, treat the 6× as indicative rather than established.
 
 ## 1. Production latency (the number that matters)
 
-Measured from `~/.murmur/history.jsonl` — **120 real dictations**, not synthetic clips.
+Measured from `~/.wispr/history.jsonl` — **120 real dictations**, not synthetic clips.
 This is release-key → text-pasted, end to end.
 
 | | |
@@ -99,7 +99,7 @@ got the local-rules result anyway: worst of both.
 
 ## 2. Model comparison
 
-Harness: `murmur bench` over `bench/clips/*.wav` against `bench/ground_truth.json`.
+Harness: `wispr bench` over `bench/clips/*.wav` against `bench/ground_truth.json`.
 
 | Clip | Model | WER | whisper | cleanup | total | path |
 |---|---|---|---|---|---|---|
@@ -120,7 +120,7 @@ Accuracy is genuinely mixed, and the comparison is thinner than it looks:
   fell back to rules**, so that row isn't comparing like with like.
 - On `medium`, small.en is honestly better (11.1% vs 18.5%). base.en produced
   "loop an icon" where small.en produced "loop an IKEA" — both wrong for
-  "loop in Anika". Neither model gets the proper noun; the `~/.murmur/vocab.txt`
+  "loop in Anika". Neither model gets the proper noun; the `~/.wispr/vocab.txt`
   (125 terms) and `corrections.tsv` layers exist to catch exactly this.
 
 ### Recommendation, not a change
@@ -136,9 +136,9 @@ are far more annoying than latency. Try it for a day — it's one line and rever
 just as easily:
 
 ```bash
-echo base.en > ~/.murmur/whisper-model && launchctl kickstart -k gui/$UID/com.murmur.daemon
+echo base.en > ~/.wispr/whisper-model && launchctl kickstart -k gui/$UID/com.wispr.daemon
 # revert:
-rm ~/.murmur/whisper-model && launchctl kickstart -k gui/$UID/com.murmur.daemon
+rm ~/.wispr/whisper-model && launchctl kickstart -k gui/$UID/com.wispr.daemon
 ```
 
 Then re-run the numbers in §1 against fresh history and compare on real usage
@@ -172,7 +172,7 @@ Consequences worth knowing:
    `a01bc73` added visible fallback for paste/cleanup failures; **VAD-returns-nothing
    does not appear to be covered.** Worth a distinct "heard nothing" state.
 
-**Fix:** re-record with `murmur record-clip long 52` — it needs a real voice, so it
+**Fix:** re-record with `wispr record-clip long 52` — it needs a real voice, so it
 can't be automated. Until then, treat the long row as no data, not as a failure.
 
 ---

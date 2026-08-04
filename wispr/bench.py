@@ -1,11 +1,11 @@
-"""0a — benchmark harness. `murmur bench` runs the current STT + cleanup
+"""0a — benchmark harness. `wispr bench` runs the current STT + cleanup
 pipeline over 3 fixed voice clips (bench/clips/*.wav) against hand-written
 ground truth (bench/ground_truth.json) and prints WER + release->text
 latency per clip. Everything in Task 0 is judged on this harness.
 
 Clips are real voice recordings containing vault proper nouns and are
 gitignored -- personal audio never leaves this machine or gets committed.
-`murmur record-clip` records them.
+`wispr record-clip` records them.
 """
 from __future__ import annotations
 
@@ -87,8 +87,8 @@ def run(backend_override: str | None = None, model_override: str | None = None,
                          load_vocab, stt_backend, stt_beam_size, stt_model)
 
     if not GROUND_TRUTH.exists():
-        print(f"[murmur] no ground truth at {GROUND_TRUTH} -- "
-              f"run `murmur record-clip <short|medium|long> <seconds>` "
+        print(f"[wispr] no ground truth at {GROUND_TRUTH} -- "
+              f"run `wispr record-clip <short|medium|long> <seconds>` "
               f"and write bench/ground_truth.json first", file=sys.stderr)
         sys.exit(1)
     truths: dict[str, str] = json.loads(GROUND_TRUTH.read_text())
@@ -97,7 +97,7 @@ def run(backend_override: str | None = None, model_override: str | None = None,
     model_name = model_override or stt_model()
     beam_size = stt_beam_size()
 
-    print(f"[murmur bench] backend={backend_name} model={model_name} "
+    print(f"[wispr bench] backend={backend_name} model={model_name} "
           f"beam_size={beam_size} cleanup={'on' if clean else 'off'}")
     t0 = time.time()
     backend = stt.build_backend(backend_name, model_name)
@@ -154,10 +154,10 @@ def main() -> None:
     args = sys.argv[1:]
     if args and args[0] == "record":
         if len(args) != 3:
-            print("usage: murmur bench record <short|medium|long> <seconds>")
+            print("usage: wispr bench record <short|medium|long> <seconds>")
             sys.exit(1)
         path = record_clip(args[1], float(args[2]))
-        print(f"[murmur] wrote {path}")
+        print(f"[wispr] wrote {path}")
         return
     backend = model = None
     clean = True

@@ -1,4 +1,4 @@
-# Giving Murmur to someone
+# Giving Wispr to someone
 
 This is the *owner's* checklist. Everything a new user needs is in
 [README.md](README.md) — don't duplicate setup instructions here, or the two
@@ -11,11 +11,11 @@ will drift and one of them will be wrong.
 Send them two lines:
 
 ```bash
-git clone https://github.com/your-username/murmur.git ~/code/murmur
-cd ~/code/murmur && ./install/install.sh
+git clone https://github.com/your-username/wispr.git ~/code/wispr
+cd ~/code/wispr && ./install/install.sh
 ```
 
-Then: *"read the README if you get stuck, and run `murmur doctor` if it
+Then: *"read the README if you get stuck, and run `wispr doctor` if it
 misbehaves — it'll tell you exactly what's wrong."*
 
 That's it. The installer handles Python discovery, the venv, the right backend
@@ -29,7 +29,7 @@ the permission walkthrough, and a verification pass.
 The repo is **private**, so each person needs to be added:
 
 ```bash
-gh repo add-collaborator your-username/murmur <their-github-username>
+gh repo add-collaborator your-username/wispr <their-github-username>
 ```
 
 or GitHub → Settings → Collaborators → Add people. They'll need to be signed
@@ -38,7 +38,7 @@ in to git (`gh auth login` is the easiest route) before the clone works.
 To go public instead, run the secret scan below first, then:
 
 ```bash
-gh repo edit your-username/murmur --visibility public
+gh repo edit your-username/wispr --visibility public
 ```
 
 ---
@@ -46,11 +46,11 @@ gh repo edit your-username/murmur --visibility public
 ## Before sharing with anyone new
 
 **1. Confirm nothing personal is in tracked source.** Personal data lives in
-`~/.murmur/` by design, but that boundary needs re-checking whenever the code
+`~/.wispr/` by design, but that boundary needs re-checking whenever the code
 changes:
 
 ```bash
-cd ~/code/murmur
+cd ~/code/wispr
 git grep -nEi 'sk-ant-[A-Za-z0-9_-]{20}|@gmail|@example|/Users/[a-z]+/(Desktop|Documents)' \
   -- . ':!*.md'
 ```
@@ -63,7 +63,7 @@ which defeats the point of the check.
 Things that have leaked before and are now deliberately kept out of git: real
 email addresses (`config.py`), a personal network and private project codenames
 (`vocab.py`), and a hardcoded vault path (`config.py`, replaced by
-`~/.murmur/vault-path`).
+`~/.wispr/vault-path`).
 
 **2. Confirm no audio is tracked.** `bench/dumps/` holds real recordings.
 
@@ -92,11 +92,11 @@ history before making anything public — rotating the key is not enough.
 |---|---|---|
 | Code, installer, docs | ✅ | |
 | Generic seed terms (tooling words) | ✅ | |
-| Your vocabulary / people's names | | `~/.murmur/vocab.txt` |
-| Your snippets, corrections | | `~/.murmur/*` |
+| Your vocabulary / people's names | | `~/.wispr/vocab.txt` |
+| Your snippets, corrections | | `~/.wispr/*` |
 | Your API key | | Keychain |
-| Your dictation history | | `~/.murmur/history.jsonl` |
-| Your vault path | | `~/.murmur/vault-path` |
+| Your dictation history | | `~/.wispr/history.jsonl` |
+| Your vault path | | `~/.wispr/vault-path` |
 
 A fresh install starts with an empty vocabulary and the built-in seed terms.
 Nobody inherits your names.
@@ -105,7 +105,7 @@ Nobody inherits your names.
 
 ## Their API key
 
-They use **their own**, billed to them. `murmur set-key` prompts for it, reads
+They use **their own**, billed to them. `wispr set-key` prompts for it, reads
 it without echoing, validates the `sk-ant-` prefix, and stores it in their
 Keychain. Never send them yours — it's a shared-billing and shared-blast-radius
 problem, and revoking it later breaks their install.
@@ -120,7 +120,7 @@ Worth saying explicitly, because people assume the key is required.
 Ask for the output of one command:
 
 ```bash
-murmur doctor
+wispr doctor
 ```
 
 It covers the failure modes that have actually occurred: duplicate daemons

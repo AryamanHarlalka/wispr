@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 #
-# Murmur installer — sets up Murmur as a background LaunchAgent.
-# After this runs, Murmur starts at login and needs no terminal, ever.
+# Wispr installer — sets up Wispr as a background LaunchAgent.
+# After this runs, Wispr starts at login and needs no terminal, ever.
 #
-#   curl-free usage:  cd ~/code/murmur && ./install/install.sh
+#   curl-free usage:  cd ~/code/wispr && ./install/install.sh
 #
 # Safe to re-run: it tears down the old agent before installing the new one.
 set -euo pipefail
@@ -20,15 +20,17 @@ die()  { printf '\n  %sx%s %s\n\n' "$RED" "$RST" "$*"; exit 1; }
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 VENV="$REPO/.venv"
 PY="$VENV/bin/python"
-LABEL="com.murmur.daemon"
+LABEL="com.wispr.daemon"
 PLIST_SRC="$REPO/install/$LABEL.plist"
 PLIST_DST="$HOME/Library/LaunchAgents/$LABEL.plist"
-MURMUR_HOME="${MURMUR_HOME:-$HOME/.murmur}"
+WISPR_HOME="${WISPR_HOME:-$HOME/.wispr}"
+APP="$HOME/Applications/Wispr.app"
+APP_BIN="$APP/Contents/MacOS/Wispr"
 
 cat <<'BANNER'
 
   ┌─────────────────────────────────────────────┐
-  │  Murmur — local voice dictation for macOS   │
+  │  Wispr — local voice dictation for macOS    │
   │  Hold Right Option, speak, release.         │
   └─────────────────────────────────────────────┘
 BANNER
@@ -36,7 +38,7 @@ BANNER
 # ── 1. Preflight ──────────────────────────────────────────────────────────
 step "Checking your Mac"
 
-[[ "$(uname -s)" == "Darwin" ]] || die "Murmur is macOS-only (this is $(uname -s))."
+[[ "$(uname -s)" == "Darwin" ]] || die "Wispr is macOS-only (this is $(uname -s))."
 ok "macOS $(sw_vers -productVersion)"
 
 ARCH="$(uname -m)"
@@ -52,13 +54,15 @@ fi
 # Two daemons on one microphone produce intermittent CoreAudio failures that
 # present as "it randomly stops working" and are near-impossible to diagnose
 # from the symptoms. This cost two weeks once; never again.
+# Anchored to com.wispr.* on purpose: the unrelated Wispr Flow app registers
+# com.electron.wispr-flow jobs and must never be touched by this installer.
 STALE=()
 while IFS= read -r f; do [[ -n "$f" ]] && STALE+=("$f"); done < <(
-  find "$HOME/Library/LaunchAgents" -maxdepth 1 -iname '*murmur*.plist' \
-       -o -maxdepth 1 -iname '*wispr*.plist' 2>/dev/null | grep -v "/$LABEL.plist$" || true
+  find "$HOME/Library/LaunchAgents" -maxdepth 1 -iname 'com.wispr.*.plist' \
+       2>/dev/null | grep -v "/$LABEL.plist$" || true
 )
 if (( ${#STALE[@]} )); then
-  step "Removing ${#STALE[@]} older Murmur service(s)"
+  step "Removing ${#STALE[@]} older Wispr service(s)"
   for f in "${STALE[@]}"; do
     lbl="$(basename "$f" .plist)"
     launchctl bootout "gui/$UID/$lbl" 2>/dev/null || true
@@ -127,22 +131,34 @@ fi
 
 # Apple Silicon only: MLX runs Whisper on the GPU and is several times faster
 # than the CPU backend. There is no Intel wheel, so this is skipped there and
-# murmur.config.resolve_backend() falls back to faster-whisper automatically.
+# wispr.config.resolve_backend() falls back to faster-whisper automatically.
 if (( USE_MLX )); then
   if "$PY" -m pip install --quiet mlx-whisper 2>/dev/null; then
-    ok "GPU transcription installed (mlx-whisper) — Murmur will use it automatically"
+    ok "GPU transcription installed (mlx-whisper) — Wispr will use it automatically"
   else
     warn "mlx-whisper unavailable — falling back to the CPU backend (still works)"
   fi
 fi
 
-mkdir -p "$MURMUR_HOME/logs"
-ok "Config home ready at $MURMUR_HOME"
+mkdir -p "$WISPR_HOME/logs"
+ok "Config home ready at $WISPR_HOME"
+
+# ── 2b. Build Wispr.app ───────────────────────────────────────────────────
+# NOT optional, and not cosmetic. The daemon must run from our own bundle
+# rather than .venv/bin/python, because macOS ties microphone consent to a
+# code-signing identity and the stock framework Python.app is hardened-runtime
+# signed WITHOUT the audio-input entitlement. Under that identity the mic opens
+# successfully and returns nothing but zeros — dictation silently transcribes
+# silence, with no error anywhere. Skipping this step resurrects that bug.
+# See install/build-app.sh for the full reasoning.
+step "Building Wispr.app (needed for microphone access)"
+"$REPO/install/build-app.sh" "$PY" || die "Could not build $APP — see the error above."
+[[ -x "$APP_BIN" ]] || die "Build reported success but $APP_BIN is missing."
 
 # ── 3. Anthropic key (optional, for Haiku cleanup) ────────────────────────
 step "Haiku cleanup (optional)"
 
-say "  Murmur transcribes ${BOLD}entirely on your Mac${RST} — your audio never leaves it,"
+say "  Wispr transcribes ${BOLD}entirely on your Mac${RST} — your audio never leaves it,"
 say "  with or without a key."
 say ""
 say "  Optionally, it can send the resulting ${BOLD}text${RST} (never the audio) to Claude"
@@ -155,10 +171,10 @@ say "  ${DIM}Skip this and it uses local cleanup rules — good, just less polis
 say "  ${DIM}Stored in your macOS Keychain. Never written to disk or to the repo.${RST}"
 say ""
 
-if security find-generic-password -s murmur-anthropic -w >/dev/null 2>&1; then
+if security find-generic-password -s wispr-anthropic -w >/dev/null 2>&1; then
   ok "Anthropic key already in your keychain — skipping"
 elif [[ -n "${ANTHROPIC_API_KEY:-}" ]]; then
-  security add-generic-password -U -s murmur-anthropic -a "$USER" -w "$ANTHROPIC_API_KEY"
+  security add-generic-password -U -s wispr-anthropic -a "$USER" -w "$ANTHROPIC_API_KEY"
   ok "Stored ANTHROPIC_API_KEY from your environment into the keychain"
 elif [[ ! -t 0 ]]; then
   warn "No key found and not running interactively — skipping (local rules only)"
@@ -168,11 +184,11 @@ else
   read -rs USERKEY || true
   echo
   if [[ -n "${USERKEY:-}" ]]; then
-    security add-generic-password -U -s murmur-anthropic -a "$USER" -w "$USERKEY"
-    ok "Key stored in macOS keychain as 'murmur-anthropic'"
+    security add-generic-password -U -s wispr-anthropic -a "$USER" -w "$USERKEY"
+    ok "Key stored in macOS keychain as 'wispr-anthropic'"
   else
-    warn "Skipped — Murmur will use local cleanup rules only"
-    say  "     Add one later with: security add-generic-password -U -s murmur-anthropic -a \$USER -w sk-ant-..."
+    warn "Skipped — Wispr will use local cleanup rules only"
+    say  "     Add one later with: security add-generic-password -U -s wispr-anthropic -a \$USER -w sk-ant-..."
   fi
   unset USERKEY
 fi
@@ -180,11 +196,11 @@ fi
 # ── 4. Vocabulary (optional, Obsidian users) ──────────────────────────────
 step "Custom vocabulary (optional)"
 
-if [[ -n "${MURMUR_VAULT:-}" && -d "${MURMUR_VAULT:-}" ]]; then
-  "$PY" -m murmur vocab >/dev/null 2>&1 && ok "Vocab built from $MURMUR_VAULT" \
+if [[ -n "${WISPR_VAULT:-}" && -d "${WISPR_VAULT:-}" ]]; then
+  "$PY" -m wispr vocab >/dev/null 2>&1 && ok "Vocab built from $WISPR_VAULT" \
     || warn "Vocab build failed — continuing with built-in terms"
 else
-  say "  Murmur can learn names and jargon from an Obsidian vault so it stops"
+  say "  Wispr can learn names and jargon from an Obsidian vault so it stops"
   say "  mishearing them. ${DIM}Only proper nouns are extracted, never note content.${RST}"
   say ""
   if [[ ! -t 0 ]]; then
@@ -198,28 +214,28 @@ else
   if [[ -n "${VAULTPATH:-}" ]]; then
     VAULTPATH="${VAULTPATH/#\~/$HOME}"
     if [[ -d "$VAULTPATH" ]]; then
-      MURMUR_VAULT="$VAULTPATH" "$PY" -m murmur vocab >/dev/null 2>&1 \
+      WISPR_VAULT="$VAULTPATH" "$PY" -m wispr vocab >/dev/null 2>&1 \
         && ok "Vocab built from $VAULTPATH" || warn "Vocab build failed — continuing"
-      printf '%s\n' "$VAULTPATH" > "$MURMUR_HOME/vault-path"
+      printf '%s\n' "$VAULTPATH" > "$WISPR_HOME/vault-path"
     else
       warn "No folder at $VAULTPATH — skipping vocab"
     fi
   else
-    ok "Skipped — Murmur uses its built-in term list"
+    ok "Skipped — Wispr uses its built-in term list"
   fi
 fi
 
 # ── 5. Warm the model so the first dictation isn't slow ───────────────────
 step "Downloading the speech model"
 
-BACKEND="$("$PY" -c 'from murmur.config import stt_backend; print(stt_backend())' 2>/dev/null || echo faster-whisper)"
-MODEL="$("$PY" -c 'from murmur.config import stt_model; print(stt_model())' 2>/dev/null || echo base.en)"
+BACKEND="$("$PY" -c 'from wispr.config import stt_backend; print(stt_backend())' 2>/dev/null || echo faster-whisper)"
+MODEL="$("$PY" -c 'from wispr.config import stt_model; print(stt_model())' 2>/dev/null || echo base.en)"
 say "  Backend: ${BOLD}$BACKEND${RST}  ·  model: ${BOLD}$MODEL${RST}"
 say "  ${DIM}Downloading once, then cached forever. This is the slow step.${RST}"
 # Backend-aware: the two engines take different model namespaces, so this
 # must go through the same resolution the daemon uses rather than assuming.
 if "$PY" - <<'PYEOF' 2>/dev/null
-from murmur.config import stt_backend, stt_model
+from wispr.config import stt_backend, stt_model
 b, m = stt_backend(), stt_model()
 if b == "mlx-whisper":
     import mlx_whisper, numpy as np
@@ -243,26 +259,34 @@ mkdir -p "$HOME/Library/LaunchAgents"
 launchctl bootout "gui/$UID/$LABEL" 2>/dev/null || true
 launchctl unload  "$PLIST_DST"      2>/dev/null || true
 
-REAL_PY="$(cd "$(dirname "$PY")" && pwd)/$(basename "$PY")"
-sed -e "s|__PYTHON__|$REAL_PY|g" \
+# The bundled interpreter cannot find its own stdlib or the venv by relative
+# path, so both are passed explicitly.
+PYHOME="$("$PY" -c 'import sys; print(sys.base_prefix)')"
+PYVER_SHORT="$("$PY" -c 'import sys; print("%d.%d" % sys.version_info[:2])')"
+PYPATH="$VENV/lib/python$PYVER_SHORT/site-packages:$REPO"
+
+sed -e "s|__APP_BIN__|$APP_BIN|g" \
     -e "s|__WORKDIR__|$REPO|g" \
     -e "s|__HOME__|$HOME|g" \
+    -e "s|__PYTHONHOME__|$PYHOME|g" \
+    -e "s|__PYTHONPATH__|$PYPATH|g" \
     "$PLIST_SRC" > "$PLIST_DST"
 plutil -lint "$PLIST_DST" >/dev/null || die "Generated plist is malformed — this is a bug, please report it."
 ok "LaunchAgent written to $PLIST_DST"
 
 launchctl bootstrap "gui/$UID" "$PLIST_DST" 2>/dev/null \
   || launchctl load "$PLIST_DST" 2>/dev/null \
-  || die "Could not start the service. Check $MURMUR_HOME/logs/daemon.err.log"
+  || die "Could not start the service. Check $WISPR_HOME/logs/daemon.err.log"
 launchctl kickstart -k "gui/$UID/$LABEL" 2>/dev/null || true
 ok "Service started, and will start automatically at login"
 
 # ── 7. Permissions — the part people get stuck on ─────────────────────────
 step "Two permissions to grant (macOS requires you to do this by hand)"
 
-# TCC attributes trust to the REAL binary, so resolve symlinks — granting the
-# venv's symlinked python and then running the resolved one silently fails.
-TCC_BIN="$("$PY" -c 'import os,sys;print(os.path.realpath(sys.executable))' 2>/dev/null || echo "$REAL_PY")"
+# TCC attributes trust to the running bundle. The daemon runs from Wispr.app,
+# so Wispr.app is what has to be added — granting the venv's python instead
+# looks like it worked and then does nothing.
+TCC_BIN="$APP"
 printf '%s' "$TCC_BIN" | pbcopy 2>/dev/null || true
 
 cat <<EOF
@@ -284,6 +308,9 @@ cat <<EOF
   ${BOLD}2. Microphone${RST}
      The first time you hold Right Option, macOS asks. Click OK.
      ${DIM}(Or pre-grant it: System Settings → Privacy & Security → Microphone)${RST}
+
+  ${DIM}Both grants are attached to Wispr.app's signature. If the bundle id or
+  signature ever changes, macOS drops them and you re-grant once.${RST}
 
 EOF
 
@@ -307,7 +334,7 @@ launchctl kickstart -k "gui/$UID/$LABEL" 2>/dev/null || true
 sleep 4
 
 set +e
-"$PY" -m murmur doctor
+"$PY" -m wispr doctor
 DOCTOR_RC=$?
 set -e
 
@@ -317,11 +344,11 @@ cat <<EOF
             Double-tap Right Option for hands-free; tap once to stop.
 
   ${BOLD}If anything misbehaves, run this first:${RST}
-            ${BOLD}$PY -m murmur doctor${RST}
+            ${BOLD}$PY -m wispr doctor${RST}
             It names the problem and prints the exact fix.
 
-  ${BOLD}Add an API key later:${RST}  $PY -m murmur set-key
-  ${BOLD}Restart:${RST}              $PY -m murmur restart
+  ${BOLD}Add an API key later:${RST}  $PY -m wispr set-key
+  ${BOLD}Restart:${RST}              $PY -m wispr restart
   ${BOLD}Remove completely:${RST}    ./install/uninstall.sh
 
 EOF

@@ -1,4 +1,4 @@
-"""STT backend abstraction (Task 0c). ~/.murmur/config.toml [stt].backend
+"""STT backend abstraction (Task 0c). ~/.wispr/config.toml [stt].backend
 picks the engine; daemon.py's IncrementalTranscriber and whole-utterance
 decode path both go through get_backend().transcribe() so the choice is a
 config swap, not a rewrite. See config.stt_backend() for the benchmark
@@ -14,7 +14,7 @@ from pathlib import Path
 
 import numpy as np
 
-from .config import MURMUR_HOME
+from .config import WISPR_HOME
 
 
 class Segment:
@@ -69,7 +69,7 @@ class WhisperCppBackend(Backend):
     this same backend gets Metal for free and should be revisited there.
     """
 
-    _MODEL_DIR = MURMUR_HOME / "stt-models"
+    _MODEL_DIR = WISPR_HOME / "stt-models"
 
     def __init__(self, model_name: str) -> None:
         import shutil

@@ -9,7 +9,7 @@ reach the callback, and that state is reset so the next press retries.
 import sys
 import threading
 
-import murmur.daemon as d
+import wispr.daemon as d
 
 FAILS = []
 
