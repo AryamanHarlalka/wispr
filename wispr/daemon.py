@@ -414,6 +414,35 @@ def paste_text(text: str, target_app=None) -> None:
     _schedule_restore(gen)
 
 
+def _send_cmd_v() -> None:
+    """Synthetic Cmd-V via Quartz CGEventPost (B2) — replaces the ~150 ms
+    osascript round-trip. Quartz is already installed as a pynput dep.
+    Falls back to osascript if Quartz is unavailable, keeping the old
+    error reporting (osascript stderr surfaces missing Accessibility)."""
+    try:
+        import Quartz
+        kVK_ANSI_V = 9
+        src = Quartz.CGEventSourceCreate(Quartz.kCGEventSourceStateHIDSystemState)
+        down = Quartz.CGEventCreateKeyboardEvent(src, kVK_ANSI_V, True)
+        up = Quartz.CGEventCreateKeyboardEvent(src, kVK_ANSI_V, False)
+        Quartz.CGEventSetFlags(down, Quartz.kCGEventFlagMaskCommand)
+        Quartz.CGEventSetFlags(up, Quartz.kCGEventFlagMaskCommand)
+        Quartz.CGEventPost(Quartz.kCGHIDEventTap, down)
+        Quartz.CGEventPost(Quartz.kCGHIDEventTap, up)
+        return
+    except Exception:
+        pass
+    r = subprocess.run(
+        ["osascript", "-e",
+         'tell application "System Events" to keystroke "v" using command down'],
+        capture_output=True, text=True,
+    )
+    if r.returncode != 0:
+        raise RuntimeError(
+            f"paste failed (grant Accessibility to Wispr.app in "
+            f"System Settings > Privacy & Security): {r.stderr.strip()[:120]}")
+
+
 def _send_backspaces(n: int) -> None:
     """n synthetic backspaces via Quartz, used to retract an instant paste
     before replacing it (see Daemon._revise_in_place).
@@ -1085,18 +1114,45 @@ class Daemon:
         """
         import Quartz
 
+        import queue
+
         FN = Quartz.kCGEventFlagMaskSecondaryFn
         DISABLED = (Quartz.kCGEventTapDisabledByTimeout,
                     Quartz.kCGEventTapDisabledByUserInput)
+
+        # Key transitions are handed to this queue by the tap callback and
+        # executed here instead, off the event-delivery thread. Unbounded on
+        # purpose: dropping a key-up would strand the daemon mid-recording,
+        # which is worse than a momentarily long queue.
+        events: "queue.Queue[bool]" = queue.Queue()
+
+        def worker() -> None:
+            while True:
+                is_down = events.get()
+                try:
+                    if is_down:
+                        self._hotkey_down()
+                    else:
+                        self._hotkey_up()
+                except Exception as e:
+                    print(f"[wispr] Fn worker error: "
+                          f"{e.__class__.__name__}: {e}", flush=True)
+
+        threading.Thread(target=worker, daemon=True,
+                         name="wispr-fn-worker").start()
 
         while True:
             down = [False]
             tap = None
 
             def cb(proxy, etype, event, refcon):  # noqa: ANN001
+                # MUST return almost immediately. macOS revokes a tap whose
+                # callback overruns its latency budget, and _hotkey_up()
+                # transcribes, cleans and pastes -- roughly a second. Doing
+                # that here meant every dictation killed the tap that was
+                # driving it. Read the flag, hand it to the worker, leave.
                 try:
                     if etype in DISABLED:
-                        # Re-arm rather than sit there deaf.
                         print("[wispr] Fn tap disabled by macOS — re-enabling",
                               flush=True)
                         Quartz.CGEventTapEnable(tap, True)
@@ -1104,10 +1160,7 @@ class Daemon:
                     is_down = bool(Quartz.CGEventGetFlags(event) & FN)
                     if is_down != down[0]:
                         down[0] = is_down
-                        if is_down:
-                            self._hotkey_down()
-                        else:
-                            self._hotkey_up()
+                        events.put(is_down)
                 except Exception as e:
                     # Same contract as the pynput guards: never let an
                     # exception escape into the tap callback.
@@ -1143,6 +1196,10 @@ class Daemon:
                 Quartz.CFRunLoopRunInMode(Quartz.kCFRunLoopDefaultMode,
                                           1.0, False)
 
+            # Only reached when the tap could not be re-armed from inside
+            # the callback, i.e. it is genuinely gone. Recording state is
+            # unknowable at that point, so reset it -- but note this is now
+            # rare, where before it fired on every single dictation.
             self._abandon_in_flight()
             print("[wispr] Fn tap stopped — rebuilding in 2 s", flush=True)
             time.sleep(2.0)
