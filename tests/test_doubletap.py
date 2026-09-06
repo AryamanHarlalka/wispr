@@ -111,6 +111,8 @@ def make_daemon():
     dm.modes = {}
     dm.snippets = {}
     dm.corrections = {}
+    dm.dictionary = []; dm._edit_watcher = None
+    dm._front_at_press = None; dm._front_at_press_t = 0.0
 
     dm.started = 0
     dm.stopped = 0

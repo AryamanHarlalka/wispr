@@ -1,41 +1,47 @@
-"""F6 — on-screen feedback pill (Tkinter, threaded) + state file for the
-menu-bar companion. Five states: listening / transcribing / cleaning /
-pasted / error. The v2 lesson: invisible feedback reads as broken — the
-pill sits bottom-center, always-on-top, and every state looks different.
+"""On-screen feedback pill + state file for the menu-bar companion.
 
-B6 (visual rework): the pill is now a stadium capsule styled after
-Wispr Flow (the unrelated commercial dictation app, no relation to this
-project), drawn on a single canvas. Design target observed from Wispr
-Flow's *public* homepage hero animation (wisprflow.ai): a capsule pill whose recording
-state is a row of ~20 thin, round-capped bars where quiet bars collapse
-into dots (min height == bar width), heights easing smoothly instead of
-snapping. Values here are our own; only the look was matched by eye.
+States: listening / transcribing / cleaning / pasted / error. Invisible
+feedback reads as broken, so the pill sits bottom-center, always on top,
+and every state looks different.
 
-Rendering details:
-- The capsule body is one `create_line` with `capstyle=round` and
-  `width=pill_height` — a perfect stadium with no seams.
-- On macOS aqua Tk the window is made transparent
-  (`-transparent` + `systemTransparent` bg) so only the capsule shows;
-  where that isn't available we fall back to a solid near-black window
-  (square corners, dark-on-dark, still presentable).
-- Bars are round-capped `create_line`s too, so a zero-height bar is a
-  dot — the signature Wispr Flow idle look.
-- A 33 ms frame loop eases displayed bar heights toward their targets
-  (fast attack, slow release) and eases the pill's width when the
-  content changes, so state changes morph instead of jumping.
-- transcribing/cleaning show a low-amplitude traveling shimmer across
-  the bars: "thinking", visibly different from live audio.
+2026-09-06: rewritten on AppKit (NSPanel + a custom NSView), replacing the
+Tk implementation. Tk had two problems that could not be fixed from the
+outside:
 
-The fragile machinery is untouched from the three rounds of debugging
-that got it working: the accessory-app activation policy
-(`_make_accessory_app`), Tk owning the process main thread, and the
-queue-based producer/consumer between daemon threads and the Tk loop.
+  * A Tk toplevel belongs to one Space. When the app being dictated into
+    was full-screen (its own Space), showing the pill either did not
+    appear at all or yanked macOS back to the desktop mid-sentence. Tk
+    re-applies its own window attributes on every map, which is why
+    setting the collection behaviour after `deiconify` was a coin toss.
+  * Tk's window could still become key, so Wispr itself was sometimes the
+    frontmost app when the next hotkey press arrived, and the paste went
+    to Wispr instead of the user's app.
+
+The panel here is a non-activating NSPanel that declares to Cocoa:
+  CanJoinAllSpaces     -- exists in every Space, never forces a switch;
+  FullScreenAuxiliary  -- allowed to float over a full-screen app;
+  Stationary           -- does not slide with Spaces animations;
+  IgnoresCycle         -- never part of Cmd-` / app switching.
+It cannot become key or main, ignores the mouse, and the process runs
+with the Accessory activation policy, so it never takes focus from the
+app the user is dictating into.
+
+Look: a stadium capsule with a row of thin round-capped bars whose quiet
+bars collapse into dots (the idle look), heights easing smoothly instead
+of snapping; transcribing/cleaning show a low travelling shimmer.
+
+Threading contract (unchanged from the Tk version): AppKit owns the
+process main thread (`run()` blocks on NSApplication.run). The daemon's
+heavy work runs on a background thread started via `start_background`;
+state updates flow through queues drained by an NSTimer on the main loop.
 """
 from __future__ import annotations
 
 import json
 import math
+import os
 import queue
+import signal
 import threading
 import time
 
@@ -43,45 +49,46 @@ from .config import WISPR_HOME, ensure_home
 
 STATE_FILE = WISPR_HOME / "state.json"
 
-# --- palette (ours; Apple-system-adjacent accents) ---
-PILL_BG = "#161616"
-TEXT_FG = "#d9d7d0"
+# --- palette ---
+PILL_BG = (0x16, 0x16, 0x16)
+TEXT_FG = (0xd9, 0xd7, 0xd0)
 COLORS = {
-    "listening": ("#f5f3ec", "listening"),
-    "transcribing": ("#ffbd2e", "transcribing"),
-    "cleaning": ("#5ac8fa", "cleaning"),
-    "pasted": ("#32d74b", "pasted"),
-    "error": ("#ff5f57", "error"),
+    "listening": ((0xf5, 0xf3, 0xec), "listening"),
+    "transcribing": ((0xff, 0xbd, 0x2e), "transcribing"),
+    "cleaning": ((0x5a, 0xc8, 0xfa), "cleaning"),
+    "pasted": ((0x32, 0xd7, 0x4b), "pasted"),
+    "error": ((0xff, 0x5f, 0x57), "error"),
 }
+IDLE_COLOR = (0x88, 0x88, 0x88)
 
-# --- capsule + waveform geometry (B6) ---
+# --- capsule + waveform geometry ---
 BAR_COUNT = 20
-BAR_W = 3            # bar thickness; also the "dot" diameter at rest
-BAR_PERIOD = 6       # horizontal distance between bar centers
-BAR_MAX_H = 20       # tallest bar (peaks stay inside the capsule)
-PILL_H = 32
-PAD_X = 15           # capsule end-cap padding before first/last content
+BAR_W = 3.0          # bar thickness; also the "dot" diameter at rest
+BAR_PERIOD = 6.0     # horizontal distance between bar centers
+BAR_MAX_H = 20.0     # tallest bar (peaks stay inside the capsule)
+PILL_H = 32.0
+PAD_X = 15.0         # capsule end-cap padding before first/last content
 WAVE_W = (BAR_COUNT - 1) * BAR_PERIOD
-FONT = ("Helvetica Neue", 12)
-BOTTOM_MARGIN = 118  # px above the bottom screen edge (clears the Dock)
+TEXT_GAP = 12.0
+FONT_SIZE = 12.5
+BOTTOM_MARGIN = 26.0  # px above the visible screen area (Dock excluded)
+SHADOW = True
 
-# Recorder.level is a raw abs-mean of float32 samples — typically small
-# (quiet speech ~0.01-0.05). This gain just maps that range onto 0..1 for
-# bar height; it's a cosmetic scale, not a calibrated meter.
+# Recorder.level is a raw abs-mean of float32 samples (quiet speech
+# ~0.01-0.05); this gain maps it onto 0..1 for bar height.
 LEVEL_GAIN = 22.0
 
 # --- animation timing ---
-FRAME_MS = 33         # ~30 fps render/ease loop
+FRAME_S = 1.0 / 30.0
 ATTACK = 0.55         # per-frame easing toward a *louder* target
 RELEASE = 0.22        # per-frame easing toward a *quieter* target
 WIDTH_EASE = 0.35     # per-frame easing of pill width changes
-FADE_STEPS = 5
-FADE_MS = 16          # ~80 ms full fade
-COLOR_STEPS = 6
-COLOR_MS = 18         # ~108 ms color cross-fade between states
+ALPHA_EASE = 0.45     # per-frame easing of window alpha
+COLOR_EASE = 0.35     # per-frame easing of the accent colour
 PILL_ALPHA = 0.94
-SHIMMER_SPEED = 5.2   # rad/s of the traveling "thinking" wave
+SHIMMER_SPEED = 5.2   # rad/s of the travelling "thinking" wave
 SHIMMER_AMP = 5.0     # px amplitude of that wave
+PASTED_HOLD_S = 0.9   # how long "pasted" stays up before fading
 
 
 def write_state(state: str, detail: str = "") -> None:
@@ -93,172 +100,255 @@ def write_state(state: str, detail: str = "") -> None:
         pass
 
 
-def _hex_to_rgb(h: str) -> tuple[int, int, int]:
-    h = h.lstrip("#")
-    return int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
-
-
-def _lerp_hex(a: str, b: str, t: float) -> str:
+def _lerp_rgb(a, b, t: float):
     t = max(0.0, min(1.0, t))
-    ar, ag, ab = _hex_to_rgb(a)
-    br, bg, bb = _hex_to_rgb(b)
-    r = round(ar + (br - ar) * t)
-    g = round(ag + (bg - ag) * t)
-    bl = round(ab + (bb - ab) * t)
-    return f"#{r:02x}{g:02x}{bl:02x}"
+    return tuple(a[i] + (b[i] - a[i]) * t for i in range(3))
+
+
+_CLASSES = None
+
+
+def _objc_classes():
+    """The Objective-C subclasses, registered with the runtime exactly
+    once per process (pyobjc raises on a second registration by name)."""
+    global _CLASSES
+    if _CLASSES is not None:
+        return _CLASSES
+    from AppKit import NSPanel, NSView
+    from Foundation import NSObject
+
+    class WisprPillPanel(NSPanel):
+        def canBecomeKeyWindow(self):  # noqa: N802
+            return False
+
+        def canBecomeMainWindow(self):  # noqa: N802
+            return False
+
+    class WisprPillView(NSView):
+        owner = None
+
+        def isFlipped(self):  # noqa: N802
+            return True
+
+        def drawRect_(self, rect):  # noqa: N802
+            ind = self.owner
+            if ind is None:
+                return
+            try:
+                ind._draw(self)
+            except Exception as e:
+                print(f"[wispr] indicator draw error: "
+                      f"{e.__class__.__name__}: {e}", flush=True)
+
+    class WisprPillDriver(NSObject):
+        owner = None
+
+        def tick_(self, _timer):  # noqa: N802
+            ind = self.owner
+            if ind is None:
+                return
+            try:
+                ind._frame()
+            except Exception as e:
+                print(f"[wispr] indicator frame error: "
+                      f"{e.__class__.__name__}: {e}", flush=True)
+
+    _CLASSES = (WisprPillPanel, WisprPillView, WisprPillDriver)
+    return _CLASSES
 
 
 class Indicator:
-    """Owns the Tk root + mainloop. Tk/Cocoa on macOS requires this to run on
-    the process's real main thread — v3's first cut spun Tk on a background
-    thread while pynput drove the main thread's runloop, and the two fought
-    over NSWindow ownership until Python crashed with an uncaught NSException.
-    Fix: Indicator now *is* the main-thread owner. The daemon's heavy init
-    (model load) and the hotkey listener run on a background thread instead,
-    started via `start_background`; state updates flow back through the same
-    queue as before, drained by Tk's own `after()` polling on the main loop.
-    """
+    """Owns the AppKit run loop. `run()` must be called on the process main
+    thread; everything else may be called from any thread."""
 
     def __init__(self) -> None:
-        self._q: queue.Queue[tuple[str, str]] = queue.Queue()
-        self._level_q: queue.Queue[float] = queue.Queue()
-        self._targets: list[float] = [0.0] * BAR_COUNT   # raw scrolled levels
-        self._disp: list[float] = [0.0] * BAR_COUNT      # eased on-screen px
-        self._root = None
+        self._q: "queue.Queue[tuple[str, str]]" = queue.Queue()
+        self._level_q: "queue.Queue[float]" = queue.Queue()
+        self._targets: list[float] = [0.0] * BAR_COUNT
+        self._disp: list[float] = [0.0] * BAR_COUNT
         self._state = "idle"
         self._text = ""
-        self._current_color = "#888888"
+        self._color = IDLE_COLOR
+        self._color_target = IDLE_COLOR
         self._visible = False
-        self._transparent = False
-        self._disp_w = 0.0        # eased pill width
-        self._placed_geo = ""     # last geometry string actually applied
+        self._alpha = 0.0
+        self._alpha_target = 0.0
+        self._disp_w = 0.0
+        self._shadow_w = -1.0
         self._t0 = time.time()
-        self._last_change = 0.0   # keeps drawing briefly after state changes
-        try:
-            import tkinter as tk
-            self._tk = tk
-        except Exception:
-            self._tk = None  # headless: state file still works for the menu bar
+        self._hide_at = 0.0
+        self._panel = None
+        self._view = None
+        self._font = None
+        self._text_w_cache: dict[str, float] = {}
+        self._headless = False
 
+    # ---- producer side (any thread) ----
     def set(self, state: str, detail: str = "") -> None:
         write_state(state, detail)
-        self._q.put((state, detail))
+        if not self._headless:
+            self._q.put((state, detail))
 
     def hide(self) -> None:
         write_state("idle")
         self._q.put(("hide", ""))
 
     def push_level(self, level: float) -> None:
-        """Feed a Recorder.level sample in; scrolled into the waveform on
-        the next frame while state == 'listening'. Cheap producer side (one
-        float queued); all drawing happens on the Tk thread in _frame()."""
+        if self._headless:
+            return  # nobody drains the queue without a run loop
         self._level_q.put(level)
 
     def start_background(self, target, *args, **kwargs) -> None:
-        """Run the daemon's own work (model load + hotkey listener) on a
-        background thread, keeping this thread free for Tk's mainloop."""
         threading.Thread(target=target, args=args, kwargs=kwargs,
-                          daemon=True).start()
+                         daemon=True).start()
 
+    # ---- main thread ----
     def run(self) -> None:
-        """Build the Tk window and block on mainloop. Must be called from the
-        real main thread (i.e. from `if __name__ == '__main__'` / process
-        entry), after `start_background` has kicked off the daemon logic."""
-        if self._tk is None:
-            # headless fallback: just idle so the process stays alive for
-            # the background thread; state file still updates.
+        """Build the panel and block on the AppKit run loop. Falls back to
+        a headless idle loop (state file only) where AppKit is missing, so
+        the daemon still works on a machine without pyobjc."""
+        try:
+            self._build()
+        except Exception as e:  # pragma: no cover - only off-macOS
+            print(f"[wispr] indicator: AppKit unavailable ({e.__class__.__name__}: "
+                  f"{e}); running without the on-screen pill", flush=True)
+            self._headless = True
             while True:
                 time.sleep(3600)
-        tk = self._tk
-        self._root = tk.Tk()
-        self._root.withdraw()
-        self._root.overrideredirect(True)
-        self._root.attributes("-topmost", True)
+        # NSApplication.run swallows nothing, but Python only sees SIGINT
+        # when bytecode runs; the 30 fps timer guarantees that, so Ctrl-C
+        # in a terminal still quits promptly.
         try:
-            self._root.attributes("-alpha", 0.0)  # fade_in() brings it up
+            signal.signal(signal.SIGINT, lambda *_: os._exit(0))
+            signal.signal(signal.SIGTERM, lambda *_: os._exit(0))
         except Exception:
             pass
-        # macOS aqua Tk: fully transparent window background so only the
-        # capsule we draw is visible (true rounded corners). Falls back to
-        # a solid near-black window elsewhere.
-        canvas_bg = PILL_BG
-        try:
-            self._root.attributes("-transparent", True)
-            self._root.config(bg="systemTransparent")
-            canvas_bg = "systemTransparent"
-            self._transparent = True
-        except Exception:
-            self._transparent = False
-        self._canvas = tk.Canvas(
-            self._root, width=self._pill_w(), height=PILL_H + 2,
-            bg=canvas_bg, highlightthickness=0)
-        self._canvas.pack()
-        try:
-            import tkinter.font as tkfont
-            self._font = tkfont.Font(family=FONT[0], size=FONT[1])
-        except Exception:
-            self._font = None
-        self._make_accessory_app()
-        self._disp_w = float(self._pill_w())
-        self._frame()
-        self._root.mainloop()
+        self._app.run()
 
-    def _make_accessory_app(self) -> None:
-        """Stop this process from ever becoming macOS's 'frontmost
-        application'. Root cause of the paste bug: showing a Tk window
-        activates the whole host process, so history.jsonl showed
-        org.python.python as frontmost during every dictation — the Cmd-V
-        keystroke was landing on Python, not whatever app the user was
-        dictating into. Wispr Flow's overlay avoids this by running as an
-        accessory app (like a menu-bar app / LSUIElement) that can never
-        take frontmost focus.
+    def _build(self) -> None:
+        from AppKit import (NSApplication, NSApplicationActivationPolicyAccessory,
+                            NSBackingStoreBuffered, NSColor, NSFont, NSMakeRect,
+                            NSTimer)
+        from Foundation import NSRunLoop, NSRunLoopCommonModes
 
-        This MUST run after tk.Tk() has already built its window — Tk does
-        its own NSApplication/Cocoa setup on first Tk() call, and calling
-        NSApplication.sharedApplication() before that fights over who
-        initializes NSApp, which is what crashed with an uncaught
-        NSException on the previous attempt. Grabbing the shared instance
-        now just returns the one Tk already created and configured, so this
-        only flips a policy flag on it rather than racing its setup.
-        """
+        _PillPanel, _PillView, _Driver = _objc_classes()
+        self._NSColor = NSColor
+        self._NSMakeRect = NSMakeRect
+        self._app = NSApplication.sharedApplication()
+        # Accessory: no Dock icon, never the frontmost app. This is what
+        # stops the pill from stealing focus from the app being dictated
+        # into (the "org.python.python was frontmost" bug of old).
+        self._app.setActivationPolicy_(NSApplicationActivationPolicyAccessory)
+
+        BORDERLESS = 0
+        NONACTIVATING_PANEL = 1 << 7
+        w = self._pill_w()
+        frame = NSMakeRect(0, 0, w, PILL_H + 2)
+        panel = _PillPanel.alloc().initWithContentRect_styleMask_backing_defer_(
+            frame, BORDERLESS | NONACTIVATING_PANEL, NSBackingStoreBuffered,
+            False)
+        # Literal masks rather than the named constants: the names moved
+        # between pyobjc releases, the bit values have not.
+        CAN_JOIN_ALL_SPACES = 1 << 0
+        STATIONARY = 1 << 4
+        IGNORES_CYCLE = 1 << 6
+        FULLSCREEN_AUXILIARY = 1 << 8
+        panel.setCollectionBehavior_(CAN_JOIN_ALL_SPACES | STATIONARY
+                                     | IGNORES_CYCLE | FULLSCREEN_AUXILIARY)
+        # Pop-up-menu level: above every ordinary window, including a
+        # full-screen app's, and above the menu bar overlay.
+        POPUP_MENU_LEVEL = 101
+        panel.setLevel_(POPUP_MENU_LEVEL)
+        panel.setOpaque_(False)
+        panel.setBackgroundColor_(NSColor.clearColor())
+        panel.setHasShadow_(SHADOW)
+        panel.setIgnoresMouseEvents_(True)
+        panel.setHidesOnDeactivate_(False)
+        panel.setMovableByWindowBackground_(False)
+        panel.setAlphaValue_(0.0)
         try:
-            from AppKit import (NSApplication,
-                                NSApplicationActivationPolicyAccessory)
-            NSApplication.sharedApplication().setActivationPolicy_(
-                NSApplicationActivationPolicyAccessory)
+            panel.setAnimationBehavior_(2)  # NSWindowAnimationBehaviorNone
         except Exception:
-            pass  # non-macOS or pyobjc missing: don't block startup over it
+            pass
+        view = _PillView.alloc().initWithFrame_(frame)
+        view.owner = self
+        panel.setContentView_(view)
+        self._panel = panel
+        self._view = view
+        self._font = NSFont.systemFontOfSize_weight_(FONT_SIZE, 0.23)  # medium
+        self._disp_w = float(w)
+        self._place(w)
 
-    # --- geometry ---
-    def _text_w(self) -> int:
+        self._driver = _Driver.alloc().init()
+        self._driver.owner = self
+        timer = NSTimer.timerWithTimeInterval_target_selector_userInfo_repeats_(
+            FRAME_S, self._driver, "tick:", None, True)
+        NSRunLoop.mainRunLoop().addTimer_forMode_(timer, NSRunLoopCommonModes)
+        self._timer = timer
+
+    # ---- geometry ----
+    def _text_w(self) -> float:
         if not self._text:
-            return 0
-        if self._font is not None:
-            return self._font.measure(self._text)
-        return 7 * len(self._text)
+            return 0.0
+        cached = self._text_w_cache.get(self._text)
+        if cached is not None:
+            return cached
+        try:
+            from AppKit import NSAttributedString, NSFontAttributeName
+            s = NSAttributedString.alloc().initWithString_attributes_(
+                self._text, {NSFontAttributeName: self._font})
+            w = float(s.size().width)
+        except Exception:
+            w = 7.0 * len(self._text)
+        if len(self._text_w_cache) > 64:
+            self._text_w_cache.clear()
+        self._text_w_cache[self._text] = w
+        return w
 
-    def _pill_w(self) -> int:
-        """Target capsule width for the current content: waveform while
-        listening/working, plus text when there is any."""
+    def _show_wave(self) -> bool:
+        return self._state in ("listening", "transcribing", "cleaning")
+
+    def _pill_w(self) -> float:
+        if self._state == "idle" and self._disp_w > 0:
+            return self._disp_w  # fading out: keep the shape it had
         w = PAD_X * 2
-        show_wave = self._state in ("listening", "transcribing", "cleaning")
+        show_wave = self._show_wave()
         if show_wave or self._state == "idle":
             w += WAVE_W
         tw = self._text_w()
         if tw:
-            w += tw + (12 if show_wave else 0)
+            w += tw + (TEXT_GAP if show_wave else 0)
         return max(w, PILL_H + 2)
 
-    def _place(self, w: int) -> None:
-        sw = self._root.winfo_screenwidth()
-        sh = self._root.winfo_screenheight()
-        geo = f"{w}x{PILL_H + 2}+{(sw - w) // 2}+{sh - BOTTOM_MARGIN}"
-        if geo != self._placed_geo:
-            self._root.geometry(geo)
-            self._canvas.config(width=w, height=PILL_H + 2)
-            self._placed_geo = geo
+    def _screen(self):
+        """The screen the pill belongs on: the one under the mouse, else
+        the main screen. On a laptop this is the built-in display."""
+        from AppKit import NSEvent, NSScreen
+        try:
+            p = NSEvent.mouseLocation()
+            for s in NSScreen.screens():
+                f = s.frame()
+                if (f.origin.x <= p.x <= f.origin.x + f.size.width
+                        and f.origin.y <= p.y <= f.origin.y + f.size.height):
+                    return s
+        except Exception:
+            pass
+        return NSScreen.mainScreen() or NSScreen.screens()[0]
 
-    # --- level intake ---
+    def _place(self, w: float) -> None:
+        if self._panel is None:
+            return
+        screen = self._screen()
+        vis = screen.visibleFrame()  # excludes the Dock and menu bar
+        h = PILL_H + 2
+        x = vis.origin.x + (vis.size.width - w) / 2.0
+        y = vis.origin.y + BOTTOM_MARGIN
+        cur = self._panel.frame()
+        if (abs(cur.origin.x - x) > 0.5 or abs(cur.origin.y - y) > 0.5
+                or abs(cur.size.width - w) > 0.5):
+            self._panel.setFrame_display_(self._NSMakeRect(x, y, w, h), False)
+
+    # ---- level intake ----
     def _drain_levels(self) -> None:
         try:
             while True:
@@ -268,138 +358,133 @@ class Indicator:
         except queue.Empty:
             pass
 
-    # --- drawing ---
-    def _draw(self) -> None:
-        c = self._canvas
-        c.delete("all")
-        w = int(round(self._disp_w))
-        cy = (PILL_H + 2) // 2
-        r = PILL_H // 2
-        # capsule body: one round-capped line = a seamless stadium
-        c.create_line(r + 1, cy, w - r - 1, cy,
-                      width=PILL_H, capstyle="round", fill=PILL_BG)
+    # ---- drawing (main thread, inside drawRect) ----
+    def _rgb(self, c, alpha: float = 1.0):
+        return self._NSColor.colorWithCalibratedRed_green_blue_alpha_(
+            c[0] / 255.0, c[1] / 255.0, c[2] / 255.0, alpha)
 
-        show_wave = self._state in ("listening", "transcribing", "cleaning")
-        x = PAD_X + 1
+    def _draw(self, view) -> None:
+        from AppKit import (NSAttributedString, NSBezierPath,
+                            NSFontAttributeName, NSForegroundColorAttributeName,
+                            NSMakePoint)
+        bounds = view.bounds()
+        w = float(bounds.size.width)
+        cy = (PILL_H + 2) / 2.0
+        r = PILL_H / 2.0
+        body = NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
+            self._NSMakeRect(0.5, 1.0, w - 1.0, PILL_H), r, r)
+        self._rgb(PILL_BG).setFill()
+        body.fill()
+
+        show_wave = self._show_wave()
+        x = PAD_X + 1.0
         if show_wave:
             if self._state == "listening":
-                color = self._current_color
+                color = self._color
                 heights = self._disp
             else:
-                # "thinking" shimmer: low traveling wave in a dimmed accent
-                color = _lerp_hex(PILL_BG, self._current_color, 0.75)
+                color = _lerp_rgb(PILL_BG, self._color, 0.75)
                 t = (time.time() - self._t0) * SHIMMER_SPEED
                 heights = [SHIMMER_AMP * (0.5 + 0.5 * math.sin(t - i * 0.55))
                            for i in range(BAR_COUNT)]
-            for h in heights:
-                half = max(0.0, min(h, BAR_MAX_H)) / 2.0
-                # round caps make a zero-length line a BAR_W dot
-                c.create_line(x, cy - half, x, cy + half,
-                              width=BAR_W, capstyle="round", fill=color)
+            self._rgb(color).setFill()
+            for hgt in heights:
+                h = max(BAR_W, min(hgt, BAR_MAX_H))
+                bar = NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
+                    self._NSMakeRect(x - BAR_W / 2.0, cy - h / 2.0, BAR_W, h),
+                    BAR_W / 2.0, BAR_W / 2.0)
+                bar.fill()
                 x += BAR_PERIOD
-            x += 12 - BAR_PERIOD  # gap between last bar center and text
+            x += TEXT_GAP - BAR_PERIOD
         if self._text:
-            c.create_text(x if show_wave else PAD_X + 1, cy,
-                          text=self._text, anchor="w", font=FONT,
-                          fill=self._current_color
-                          if self._state in ("pasted", "error") else TEXT_FG)
+            fg = self._color if self._state in ("pasted", "error") else TEXT_FG
+            attrs = {NSFontAttributeName: self._font,
+                     NSForegroundColorAttributeName: self._rgb(fg)}
+            s = NSAttributedString.alloc().initWithString_attributes_(
+                self._text, attrs)
+            size = s.size()
+            tx = x if show_wave else PAD_X + 1.0
+            s.drawAtPoint_(NSMakePoint(tx, cy - size.height / 2.0))
 
-    # --- smooth transitions ---
-    def _animate_color(self, target: str) -> None:
-        start = self._current_color
-
-        def step(i: int = 0) -> None:
-            t = i / COLOR_STEPS
-            self._current_color = _lerp_hex(start, target, t)
-            if i < COLOR_STEPS:
-                self._root.after(COLOR_MS, step, i + 1)
-
-        step(0)
-
-    def _fade_alpha(self, target: float, on_done=None) -> None:
-        try:
-            current = self._root.attributes("-alpha")
-        except Exception:
-            current = target
-        steps = FADE_STEPS
-
-        def step(i: int = 0) -> None:
-            t = i / steps
-            a = current + (target - current) * t
-            try:
-                self._root.attributes("-alpha", a)
-            except Exception:
-                pass
-            if i < steps:
-                self._root.after(FADE_MS, step, i + 1)
-            elif on_done:
-                on_done()
-
-        step(0)
-
-    def _show(self) -> None:
-        if not self._visible:
-            self._visible = True
-            self._root.deiconify()
-            self._fade_alpha(PILL_ALPHA)
-
-    def _hide_now(self) -> None:
-        self._visible = False
-        self._fade_alpha(0.0, on_done=self._root.withdraw)
-
-    # --- frame loop ---
+    # ---- frame loop (main thread, NSTimer) ----
     def _frame(self) -> None:
+        now = time.time()
         try:
             while True:
                 state, detail = self._q.get_nowait()
                 if state == "hide":
                     self._state = "idle"
-                    self._hide_now()
+                    self._visible = False
+                    self._alpha_target = 0.0
+                    self._hide_at = 0.0
                     continue
-                color, text = COLORS.get(state, ("#888888", state))
+                color, text = COLORS.get(state, (IDLE_COLOR, state))
                 if state == "listening" and not detail:
-                    text = ""  # Wispr Flow look: recording is waveform-only
+                    text = ""  # recording is waveform-only
                 elif detail:
                     text = f"{text} · {detail}"
                 self._text = text
-                changed_state = state != self._state
+                changed = state != self._state
                 self._state = state
-                self._last_change = time.time()
-                if state == "listening" and changed_state:
+                if state == "listening" and changed:
                     self._targets = [0.0] * BAR_COUNT
                     self._disp = [0.0] * BAR_COUNT
-                self._show()
-                if changed_state:
-                    self._animate_color(color)
-                else:
-                    self._current_color = color
-                if state == "pasted":
-                    self._root.after(900, self._hide_now)
+                self._color_target = color
+                if changed and not self._visible:
+                    self._color = color  # first show: no cross-fade from grey
+                self._visible = True
+                self._alpha_target = PILL_ALPHA
+                self._hide_at = now + PASTED_HOLD_S if state == "pasted" else 0.0
         except queue.Empty:
             pass
 
-        if self._visible:
-            self._drain_levels()
-            if self._state == "listening":
-                # neighbor-smoothed targets + attack/release easing
-                t = self._targets
-                for i in range(BAR_COUNT):
-                    left = t[i - 1] if i > 0 else t[i]
-                    right = t[i + 1] if i < BAR_COUNT - 1 else t[i]
-                    tgt = (0.25 * left + 0.5 * t[i] + 0.25 * right) * BAR_MAX_H
-                    k = ATTACK if tgt > self._disp[i] else RELEASE
-                    self._disp[i] += (tgt - self._disp[i]) * k
-            tw = float(self._pill_w())
-            settled = abs(tw - self._disp_w) < 1.0
-            self._disp_w = tw if settled else \
-                self._disp_w + (tw - self._disp_w) * WIDTH_EASE
-            # static states (pasted/error) don't need a 30 fps redraw once
-            # the width morph and the ~short transition window are done
-            animating = (self._state in
-                         ("listening", "transcribing", "cleaning")
-                         or not settled
-                         or time.time() - self._last_change < 0.5)
-            if animating:
-                self._place(int(round(self._disp_w)))
-                self._draw()
-        self._root.after(FRAME_MS, self._frame)
+        if self._hide_at and now >= self._hide_at:
+            self._hide_at = 0.0
+            self._visible = False
+            self._alpha_target = 0.0
+            self._state = "idle"
+
+        # Nothing on screen and nothing fading: skip the work entirely.
+        if not self._visible and self._alpha < 0.005:
+            if self._panel is not None and self._panel.isVisible():
+                self._panel.setAlphaValue_(0.0)
+                self._panel.orderOut_(None)
+            return
+
+        self._drain_levels()
+        if self._state == "listening":
+            t = self._targets
+            for i in range(BAR_COUNT):
+                left = t[i - 1] if i > 0 else t[i]
+                right = t[i + 1] if i < BAR_COUNT - 1 else t[i]
+                tgt = (0.25 * left + 0.5 * t[i] + 0.25 * right) * BAR_MAX_H
+                k = ATTACK if tgt > self._disp[i] else RELEASE
+                self._disp[i] += (tgt - self._disp[i]) * k
+
+        self._color = _lerp_rgb(self._color, self._color_target, COLOR_EASE)
+        tw = self._pill_w()
+        if abs(tw - self._disp_w) < 0.75:
+            self._disp_w = tw
+        else:
+            self._disp_w += (tw - self._disp_w) * WIDTH_EASE
+        if abs(self._alpha_target - self._alpha) < 0.01:
+            self._alpha = self._alpha_target
+        else:
+            self._alpha += (self._alpha_target - self._alpha) * ALPHA_EASE
+
+        if self._panel is not None:
+            self._place(self._disp_w)
+            if not self._panel.isVisible():
+                # orderFrontRegardless: shows the panel without activating
+                # the app -- the whole point of the accessory policy.
+                self._panel.orderFrontRegardless()
+            self._panel.setAlphaValue_(self._alpha)
+            self._view.setNeedsDisplay_(True)
+            if abs(self._disp_w - self._shadow_w) > 0.5:
+                # The capsule outline changed; the window shadow is cached
+                # from the last draw and would show as a stale halo.
+                self._shadow_w = self._disp_w
+                try:
+                    self._panel.invalidateShadow()
+                except Exception:
+                    pass

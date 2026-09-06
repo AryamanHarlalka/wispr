@@ -122,6 +122,8 @@ def make_daemon():
     dm._dictation_seq = 1
     dm.indicator = FakeInd()
     dm.vocab = []; dm.modes = {}; dm.snippets = {}; dm.corrections = {}
+    dm.dictionary = []; dm._edit_watcher = None
+    dm._front_at_press = None; dm._front_at_press_t = 0.0
     dm.recorder = types.SimpleNamespace(level=0.0, _capture_rate=16000,
                                         start=lambda: None, stop=lambda: None)
     dm.model = types.SimpleNamespace(
@@ -229,7 +231,7 @@ d.modes_mod = types.SimpleNamespace(
     bundle_id_of=lambda app: "com.apple.Notes",
     mode_for=lambda b, m: "neutral",
     frontmost_app=lambda: None)
-d.vocab_mod = types.SimpleNamespace(initial_prompt=lambda v, c: "")
+d.vocab_mod = types.SimpleNamespace(initial_prompt=lambda *a, **k: "")
 PENDING = {"fut": None}
 d.cleanup = types.SimpleNamespace(
     instant_result=lambda raw, mode, v, c, s: ("Hello world.", "rules",

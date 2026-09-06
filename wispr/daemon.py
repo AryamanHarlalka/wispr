@@ -2,11 +2,12 @@
 pasted at the cursor. Double-tap Right Option toggles hands-free mode.
 
 Pipeline: record (sounddevice, chunk-decoded incrementally in the
-background — see IncrementalTranscriber, B3) -> transcribe tail only
-(faster-whisper, vault-vocab initial_prompt) -> clean (snippets -> rules ->
-Haiku w/ 2500 ms budget -> rules fallback) -> paste (clipboard-preserving)
--> history. Audio never leaves the Mac; only cleaned *text* may go to the
-API (F1).
+background — see IncrementalTranscriber) -> transcribe tail only
+(faster-whisper, dictionary + vocab initial_prompt) -> clean (snippets ->
+Haiku under a hard budget -> rules fallback) -> paste (clipboard-
+preserving) -> history -> learn (from the LLM's known-term substitutions
+and from the user's own edits to the pasted text). Audio never leaves the
+Mac; only *text* may go to the API.
 """
 from __future__ import annotations
 
@@ -18,8 +19,10 @@ from pathlib import Path
 
 import numpy as np
 
-from . import cleanup, history, modes as modes_mod, stt, vocab as vocab_mod
-from .config import (WISPR_HOME, ensure_home, load_corrections, load_modes,
+from . import (cleanup, dictionary as dict_mod, history, learn as learn_mod,
+               modes as modes_mod, stt, vocab as vocab_mod)
+from .config import (WISPR_HOME, cleanup_wait_s, ensure_home, learn_from_edits,
+                     learn_from_llm, load_corrections, load_modes,
                      load_snippets, load_vocab, paste_instant, paste_revise,
                      hotkey, revise_max_chars, revise_window_s, stt_backend,
                      stt_beam_size, stt_model)
@@ -346,45 +349,73 @@ def _schedule_restore(gen: int) -> None:
     threading.Thread(target=restore, daemon=True).start()
 
 
-def _activate_target(target_app) -> None:  # noqa: ANN001
+# How hard to try to get the target app back in front before pasting.
+ACTIVATE_ATTEMPTS = 3
+# 0.5 s per attempt: if the target app is full-screen it lives in its own
+# Space, and bringing it forward runs the Spaces animation first. A wait
+# that expires mid-animation reads as "the app never came back".
+ACTIVATE_WAIT_S = 0.5
+
+
+def _front_is(target_app) -> bool:
+    """True when `target_app` is the frontmost app right now.
+
+    A None target means "no expectation" -- callers that never captured an
+    app (tests, `wispr last`) are not blocked by this check.
+    """
+    if target_app is None:
+        return True
+    try:
+        pid = int(target_app.processIdentifier())
+    except Exception:
+        return True
+    front = _frontmost_pid()
+    return front is None or front == pid
+
+
+def _frontmost_name() -> str:
+    try:
+        from AppKit import NSWorkspace
+        front = NSWorkspace.sharedWorkspace().frontmostApplication()
+        if front is None:
+            return "?"
+        return str(front.bundleIdentifier() or front.localizedName() or "?")
+    except Exception:
+        return "?"
+
+
+def _activate_target(target_app) -> bool:  # noqa: ANN001
     """Bring the app that was frontmost when the hotkey went down back to
     the front, and wait until macOS confirms the switch.
 
-    `target_app` is the NSRunningApplication captured the instant the
-    hotkey was pressed (see Daemon._start). Wispr's own pill activates
-    itself the moment it's shown, so by the time we're ready to paste the
-    real frontmost app is almost always Wispr, not whatever the user was
-    dictating into — every history.jsonl entry logged "org.python.python".
-    That capture-and-reactivate sequence MUST stay ahead of any keystroke
-    — do not reorder.
-
-    B2: fixed sleeps replaced by polling frontmost — with the accessory-app
-    policy the target usually never lost focus, so the wait is ~0 instead
-    of a hardcoded 230 ms; when focus did move we wait only as long as the
-    activation actually takes (cap 300 ms). CGEventPost is asynchronous,
-    so this wait is the only thing keeping a Cmd-V (or a backspace run)
-    out of the app that had focus a moment ago.
-
-    Best-effort by design: it never raises. The caller decides what to do
-    when activation cannot be confirmed, by re-checking _frontmost_pid().
+    Three attempts, not one: a single activateWithOptions_ loses the race
+    whenever something else is activating at the same moment -- and with
+    the Fn/globe hotkey something usually is, because macOS runs its own
+    "Press globe key to" action off the very key press that starts the
+    dictation. Returns True once the target is confirmed frontmost.
     """
     if target_app is None:
-        return
+        return True
     try:
         from AppKit import (NSApplicationActivateIgnoringOtherApps,
                             NSWorkspace)
-        target_app.activateWithOptions_(NSApplicationActivateIgnoringOtherApps)
         ws = NSWorkspace.sharedWorkspace()
-        deadline = time.time() + 0.3
-        while time.time() < deadline:
+        pid = int(target_app.processIdentifier())
+        for _ in range(ACTIVATE_ATTEMPTS):
             front = ws.frontmostApplication()
-            if front is not None and \
-                    front.processIdentifier() == target_app.processIdentifier():
-                return
-            time.sleep(0.02)
-        time.sleep(0.05)  # never confirmed; small settle beat
+            if front is not None and int(front.processIdentifier()) == pid:
+                return True  # already in front: don't bounce it
+            target_app.activateWithOptions_(
+                NSApplicationActivateIgnoringOtherApps)
+            deadline = time.time() + ACTIVATE_WAIT_S
+            while time.time() < deadline:
+                front = ws.frontmostApplication()
+                if front is not None and int(front.processIdentifier()) == pid:
+                    return True
+                time.sleep(0.02)
+        return False
     except Exception:
-        pass
+        return False
 
 
 def paste_text(text: str, target_app=None) -> None:
@@ -404,6 +435,18 @@ def paste_text(text: str, target_app=None) -> None:
     """
     gen = _claim_clipboard(text)
     _activate_target(target_app)
+    if not _front_is(target_app):
+        _activate_target(target_app)  # one more go before giving up
+    if not _front_is(target_app):
+        # Refuse to send the keystroke. A blind Cmd-V is not a harmless
+        # no-op -- it dumps the dictation into whatever window happens to
+        # be in front. The text is already on the clipboard and already in
+        # history, so failing here is recoverable; pasting into the wrong
+        # window is not.
+        _arm_recovery()
+        raise RuntimeError(
+            "target app never came back to the front (front is "
+            + _frontmost_name() + ")")
     try:
         _send_cmd_v()
     except Exception:
@@ -473,65 +516,116 @@ def _frontmost_pid() -> int | None:
         return None
 
 
-CHUNK_INTERVAL_S = 3.0   # how often the background worker checks for new audio
-MIN_CHUNK_AUDIO_S = 4.0  # don't bother decoding a chunk shorter than this
-TRAILING_GUARD_S = 0.6   # don't commit a VAD segment that ends this close to
-                         # "now" — it may still be mid-utterance
+CHUNK_INTERVAL_S = 2.0    # how often the background worker checks for new audio
+MIN_CHUNK_AUDIO_S = 5.0   # don't bother decoding until this much new audio exists
+MAX_CHUNK_AUDIO_S = 24.0  # force a cut before Whisper's 30 s window regardless
+TRAILING_GUARD_S = 0.8    # never cut this close to "now": may be mid-word
+SILENCE_MIN_S = 0.40      # a gap this long is a safe place to cut
+_FRAME_S = 0.02           # energy analysis frame
+
+
+def find_cut(audio: np.ndarray, start: int, limit: int,
+             sample_rate: int = SAMPLE_RATE) -> int | None:
+    """Sample index of the LAST silence gap (>= SILENCE_MIN_S) that lies
+    within [start, limit), or None. Cutting in silence means neither the
+    committed chunk nor the tail starts mid-word.
+
+    Energy-based, on the raw audio, so it costs microseconds and never
+    touches the model. The threshold is relative to the region's own
+    loudness so a quiet speaker and a noisy room both work."""
+    if limit - start < int(SILENCE_MIN_S * sample_rate) * 2:
+        return None
+    region = audio[start:limit]
+    frame = max(1, int(_FRAME_S * sample_rate))
+    n = region.size // frame
+    if n < 4:
+        return None
+    frames = region[:n * frame].reshape(n, frame)
+    rms = np.sqrt(np.mean(np.square(frames), axis=1))
+    loud = float(np.percentile(rms, 90)) if rms.size else 0.0
+    thresh = max(1.5e-3, 0.12 * loud)
+    quiet = rms < thresh
+    need = max(1, int(SILENCE_MIN_S / _FRAME_S))
+    best = None
+    run = 0
+    for i, q in enumerate(quiet):
+        if q:
+            run += 1
+            if run >= need:
+                # midpoint of the gap so far: (i - run + 1 .. i)
+                best = start + int((i - run / 2.0 + 0.5) * frame)
+        else:
+            run = 0
+    return best
 
 
 class IncrementalTranscriber:
-    """B3 — decode committed audio in the background while the user is
-    still talking, so on key-release only the trailing tail needs
-    decoding. This is the riskiest piece of the v3 latency work, so it is
-    built to fail safe: every decode call is wrapped, and any error just
-    means `finalize()` returns None — the caller (Daemon._process) then
-    falls back to the exact whole-utterance decode path that shipped
-    before this feature. A dictation can never be lost to a bug here.
+    """Decode committed audio in the background while the user is still
+    talking, so on key-release only the trailing tail needs decoding.
 
-    Runs on its own background thread, started at Daemon._start() and
-    joined inside finalize(). It never touches the Indicator/Tk mainloop
-    and doesn't change how Daemon's own hotkey-listener thread or the
-    per-dictation _process thread are structured — it's an independent
-    worker that Daemon._process consults once, at the very start.
+    2026-09-06 rewrite. The previous version decoded *all* uncommitted
+    audio every interval and only committed VAD segments that ended
+    before the trailing guard — so a long, fluent dictation with few
+    pauses re-decoded an ever-growing region every 3 s (quadratic), and
+    on release the tail decode had to wait for that region's decode to
+    finish AND then decode it again. history.jsonl shows 15-125 s
+    whisper times on exactly those dictations. Now every chunk is bounded:
+    the worker cuts at the last silence gap (or at MAX_CHUNK_AUDIO_S at
+    worst), decodes just that chunk, and commits it. Each decode is a few
+    seconds of audio, the tail is at most one chunk, and the worst case
+    wait on release is one bounded decode.
+
+    Built to fail safe: every decode call is wrapped, and any error just
+    means `finalize()` returns None — the caller (Daemon._process) then
+    falls back to the exact whole-utterance decode path. A dictation can
+    never be lost to a bug here.
 
     `model_lock` is shared with Daemon._process's own transcribe() calls
-    so at most one decode ever runs against the shared WhisperModel
-    instance at a time — faster-whisper/ctranslate2 concurrent-call safety
-    isn't documented, so this sidesteps the question entirely rather than
-    relying on it.
+    so at most one decode ever runs against the shared model at a time.
     """
 
     def __init__(self, model, model_lock: threading.Lock,
-                 vocab: list[str], corrections: dict[str, str]) -> None:
+                 vocab: list[str], corrections: dict[str, str],
+                 dictionary: list[str] | None = None) -> None:
         self._model = model
         self._model_lock = model_lock
         self._vocab = vocab
         self._corrections = corrections
+        self._dictionary = dictionary
         self._stop_evt = threading.Event()
         self._thread: threading.Thread | None = None
+        self._commit_lock = threading.Lock()
         self._committed_text = ""
         self._committed_samples = 0
         self._failed = False
+        self.chunks = 0  # for logging/tests
 
     def start(self, recorder: "Recorder") -> None:
         self._thread = threading.Thread(
-            target=self._run, args=(recorder,), daemon=True)
+            target=self._run, args=(recorder,), daemon=True,
+            name="wispr-incremental")
         self._thread.start()
 
     def _run(self, recorder: "Recorder") -> None:
         while not self._stop_evt.wait(CHUNK_INTERVAL_S):
             try:
                 self._maybe_commit_chunk(recorder)
-            except Exception:
-                # Defensive: stop trying: finalize() will see _failed and
-                # tell the caller to fall back to a plain whole-decode.
+            except Exception as e:
+                # Stop trying: finalize() will see _failed and tell the
+                # caller to fall back to a plain whole-decode.
+                print(f"[wispr] incremental decode failed, will decode whole: "
+                      f"{e.__class__.__name__}: {e}", flush=True)
                 self._failed = True
                 return
 
     def _decode(self, audio: np.ndarray, extra_prompt: str) -> list:
-        prompt = vocab_mod.initial_prompt(self._vocab, self._corrections)
+        prompt = vocab_mod.initial_prompt(self._vocab, self._corrections,
+                                          self._dictionary)
         if extra_prompt:
-            prompt = f"{extra_prompt[-400:]} {prompt}"
+            # Context first, terms last: Whisper keeps the LAST ~223 prompt
+            # tokens, so this order guarantees the term list survives and
+            # only the oldest context is dropped.
+            prompt = f"{extra_prompt[-300:]} {prompt}"
         with self._model_lock:
             segments = self._model.transcribe(
                 audio, language="en", beam_size=BEAM_SIZE,
@@ -540,30 +634,41 @@ class IncrementalTranscriber:
         return segments
 
     def _maybe_commit_chunk(self, recorder: "Recorder") -> None:
+        if self._stop_evt.is_set():
+            return
         audio = recorder.snapshot()
-        new_len_s = (len(audio) - self._committed_samples) / SAMPLE_RATE
-        if new_len_s < MIN_CHUNK_AUDIO_S:
-            return
-        chunk = audio[self._committed_samples:]
-        segments = self._decode(chunk, self._committed_text)
-        if not segments:
-            return
-        # Only commit segments that aren't right at the edge of "now" —
-        # they may still be mid-utterance and get revised/continued.
-        safe_end_s = new_len_s - TRAILING_GUARD_S
-        commit = [s for s in segments if s.end <= safe_end_s]
-        if not commit:
-            return
-        text = " ".join(s.text.strip() for s in commit).strip()
-        if not text:
-            return
-        self._committed_text = f"{self._committed_text} {text}".strip()
-        self._committed_samples += int(commit[-1].end * SAMPLE_RATE)
+        with self._commit_lock:
+            committed = self._committed_samples
+            new_len_s = (len(audio) - committed) / SAMPLE_RATE
+            if new_len_s < MIN_CHUNK_AUDIO_S:
+                return
+            limit = len(audio) - int(TRAILING_GUARD_S * SAMPLE_RATE)
+            # Never look for a cut beyond MAX_CHUNK from the last commit:
+            # if the worker fell behind (CPU stall), it catches up in
+            # bounded chunks rather than one giant decode.
+            window_end = min(limit, committed + int(MAX_CHUNK_AUDIO_S * SAMPLE_RATE))
+            cut = find_cut(audio, committed + SAMPLE_RATE, window_end)
+            if cut is None:
+                if new_len_s < MAX_CHUNK_AUDIO_S:
+                    return  # wait for a pause; nothing is lost by waiting
+                cut = min(committed + int(MAX_CHUNK_AUDIO_S * SAMPLE_RATE), limit)
+            chunk = audio[committed:cut]
+            if self._stop_evt.is_set():
+                return
+            segments = self._decode(chunk, self._committed_text)
+            text = " ".join(s.text.strip() for s in segments).strip()
+            if text:
+                self._committed_text = f"{self._committed_text} {text}".strip()
+            self._committed_samples = cut
+            self.chunks += 1
 
     def stop(self) -> None:
         self._stop_evt.set()
         if self._thread is not None:
-            self._thread.join(timeout=2.0)
+            # A decode in flight holds the model lock; finalize() waits for
+            # it there anyway. This join just keeps the thread bookkeeping
+            # tidy and is bounded so a stuck decode cannot hang release.
+            self._thread.join(timeout=0.5)
 
     def finalize(self, final_audio: np.ndarray) -> str | None:
         """Stop the worker, decode just the trailing tail, and return the
@@ -573,12 +678,16 @@ class IncrementalTranscriber:
         if self._failed:
             return None
         try:
-            tail = final_audio[self._committed_samples:]
-            tail_segments = self._decode(tail, self._committed_text)
-            tail_text = " ".join(s.text.strip() for s in tail_segments).strip()
+            with self._commit_lock:  # waits for an in-flight commit to land
+                tail = final_audio[self._committed_samples:]
+                if tail.size < int(0.2 * SAMPLE_RATE):
+                    return self._committed_text
+                tail_segments = self._decode(tail, self._committed_text)
+                tail_text = " ".join(
+                    s.text.strip() for s in tail_segments).strip()
+                return f"{self._committed_text} {tail_text}".strip()
         except Exception:
             return None
-        return f"{self._committed_text} {tail_text}".strip()
 
 
 class Daemon:
@@ -587,6 +696,7 @@ class Daemon:
         self.modes = load_modes()
         self.snippets = load_snippets()
         self.corrections = load_corrections()
+        self.dictionary = dict_mod.load_dictionary()
         self.vocab = load_vocab()
         if not self.vocab:
             try:
@@ -608,6 +718,14 @@ class Daemon:
         self._pending_stop = None  # Timer holding a deferred _stop_and_process
         self._lock = threading.Lock()
         self._target_app = None  # captured at _start(), before the pill shows
+        # Frontmost app sampled inside the hotkey callback itself, with the
+        # time it was sampled. _begin_capture() runs on a worker thread one
+        # queue hop later -- by then the globe key's own system action can
+        # already have changed which app is in front.
+        self._front_at_press = None
+        self._front_at_press_t = 0.0
+        self._edit_watcher: "learn_mod.EditWatcher | None" = None
+        modes_mod.TRACKER.install()
         self._model_lock = threading.Lock()  # guards all model.transcribe() calls
         self._incremental: IncrementalTranscriber | None = None
         # Monotonic dictation counter. A pending in-place revision compares
@@ -623,7 +741,8 @@ class Daemon:
         self.model = stt.build_backend(BACKEND_NAME, MODEL_NAME)
         _key_name = "Fn" if hotkey() == "fn" else "Right Option"
         print(f"[wispr] ready — hold {_key_name} to dictate "
-              f"(vocab: {len(self.vocab)} terms, "
+              f"(vocab: {len(self.vocab)} terms, dictionary: "
+              f"{len(self.dictionary)}, corrections: {len(self.corrections)}, "
               f"llm: {'on' if cleanup._get_client() else 'off — rules only'})",
               flush=True)
 
@@ -647,6 +766,8 @@ class Daemon:
             # would deadlock every future press at the guard.
             with self._lock:
                 self.recording = False
+            if self._incremental is not None:
+                self._incremental.stop()
             self._incremental = None
             try:
                 self.recorder.stop()
@@ -657,13 +778,26 @@ class Daemon:
             self.indicator.set("error", f"mic unavailable — {str(e)[:40]}")
 
     def _begin_capture(self) -> None:
-        # Capture the real target app BEFORE the pill shows and steals
-        # frontmost status — this is the fix. Querying frontmost after
-        # recording/processing always returns Wispr itself.
-        self._target_app = modes_mod.frontmost_app()
+        # Capture the real target app BEFORE the pill shows. Prefer the
+        # sample taken in the hotkey callback (see __init__); it predates
+        # both the pill and any system panel the globe key opened. Either
+        # way it goes through modes.frontmost_app(), which never returns
+        # Wispr itself.
+        if (self._front_at_press is not None
+                and time.time() - self._front_at_press_t < 1.5):
+            self._target_app = self._front_at_press
+        else:
+            self._target_app = modes_mod.frontmost_app()
+        self._front_at_press = None
+        print("[wispr] capture target: "
+              + (modes_mod.bundle_id_of(self._target_app) or "?"), flush=True)
+        if self._edit_watcher is not None:
+            self._edit_watcher.cancel()  # the cursor belongs to this take now
+            self._edit_watcher = None
         # reload lightweight config every dictation so edits stick live
         self.snippets = load_snippets()
         self.corrections = load_corrections()
+        self.dictionary = dict_mod.load_dictionary()
         self.indicator.set("listening",
                            "hands-free" if self.hands_free else "")
         # Open the TLS connection while the user is still speaking so the
@@ -674,7 +808,8 @@ class Daemon:
         # talking, so long (hands-free) dictations only pay for the tail
         # on release instead of the whole recording.
         self._incremental = IncrementalTranscriber(
-            self.model, self._model_lock, self.vocab, self.corrections)
+            self.model, self._model_lock, self.vocab, self.corrections,
+            self.dictionary)
         self._incremental.start(self.recorder)
         # B4: feed Recorder.level to the pill's waveform while listening —
         # a small standalone thread (like the incremental worker above),
@@ -697,6 +832,8 @@ class Daemon:
             # Same contract as _start(): closing a wedged stream can raise,
             # and this runs on the pynput callback thread too. Drop the
             # take rather than the listener.
+            if self._incremental is not None:
+                self._incremental.stop()
             self._incremental = None
             print(f"[wispr] could not stop recording: "
                   f"{e.__class__.__name__}: {e}", flush=True)
@@ -715,6 +852,8 @@ class Daemon:
         if audio.size < SAMPLE_RATE * 0.3:  # <0.3 s: accidental tap
             if incremental is not None:
                 incremental.stop()
+            print("[wispr] take dropped: only %.2fs of audio (a stray tap, "
+                  "not speech)" % (audio.size / SAMPLE_RATE), flush=True)
             self.indicator.hide()
             return
         target_app = self._target_app
@@ -740,7 +879,7 @@ class Daemon:
                     segments = self.model.transcribe(
                         audio, language="en", beam_size=BEAM_SIZE,
                         initial_prompt=vocab_mod.initial_prompt(
-                            self.vocab, self.corrections),
+                            self.vocab, self.corrections, self.dictionary),
                         vad_filter=True,
                         condition_on_previous_text=CONDITION_ON_PREVIOUS_TEXT,
                     )
@@ -785,8 +924,12 @@ class Daemon:
                     cleaned, path, revision_fut = cleanup.instant_result(
                         raw, mode, self.vocab, self.corrections, self.snippets)
                 else:
+                    # Default since 2026-09-06: the LLM pass runs before
+                    # the paste, under a hard budget, so what lands on
+                    # screen is the finished text.
                     cleaned, path = cleanup.clean_text(
-                        raw, mode, self.vocab, self.corrections, self.snippets)
+                        raw, mode, self.vocab, self.corrections, self.snippets,
+                        budget_s=cleanup_wait_s())
             except Exception as e:
                 print(f"[wispr] cleanup raised, pasting raw transcript: "
                       f"{e.__class__.__name__}: {e}", flush=True)
@@ -836,10 +979,15 @@ class Daemon:
                 })
                 # The user already has text. Anything below is a bonus pass
                 # and must never be able to damage that outcome.
+                final, final_path = cleaned, path
                 if revision_fut is not None:
-                    self._revise_in_place(revision_fut, cleaned, target_app,
-                                          bundle, mode, raw, t0,
-                                          rec_id=rec_id)
+                    improved = self._revise_in_place(
+                        revision_fut, cleaned, target_app, bundle, mode, raw,
+                        t0, rec_id=rec_id)
+                    if improved:
+                        final, final_path = improved, "haiku"
+                # Learning looks at what is actually on screen now.
+                self._after_paste(final, raw, final_path, target_app)
             finally:
                 _end_revision_window()
         except Exception as e:
@@ -862,6 +1010,46 @@ class Daemon:
             except Exception:
                 pass
 
+    def _after_paste(self, cleaned: str, raw: str, path: str,
+                     target_app) -> None:
+        """Learning hooks. Never raise: a learner problem must not take
+        down a dictation that already landed on screen."""
+        try:
+            if path == "haiku" and learn_from_llm():
+                known = dict_mod.prompt_terms(
+                    self.vocab, self.corrections, self.dictionary, limit=10000)
+                learned = learn_mod.learn_from_llm(raw, cleaned, known)
+                for wrong, right in learned:
+                    print(f"[wispr] learned from cleanup: '{wrong}' -> '{right}'",
+                          flush=True)
+        except Exception as e:
+            print(f"[wispr] llm-learn failed: {e.__class__.__name__}: {e}",
+                  flush=True)
+        try:
+            if learn_from_edits() and cleaned.strip():
+                seq = self._dictation_seq
+                pid = None
+                try:
+                    pid = int(target_app.processIdentifier()) if target_app else None
+                except Exception:
+                    pid = None
+
+                def is_current() -> bool:
+                    return self._dictation_seq == seq and not self.recording
+
+                def on_learn(pairs) -> None:
+                    for wrong, right in pairs:
+                        print(f"[wispr] learned from your edit: '{wrong}' -> "
+                              f"'{right}'", flush=True)
+
+                watcher = learn_mod.EditWatcher(cleaned, pid, is_current,
+                                                on_learn=on_learn)
+                self._edit_watcher = watcher
+                watcher.start()
+        except Exception as e:
+            print(f"[wispr] edit-learn failed: {e.__class__.__name__}: {e}",
+                  flush=True)
+
     def _record_update(self, rec_id, **fields) -> None:
         """Revise the history entry written before the paste. Never
         raises: a history problem must not take down a dictation that
@@ -876,7 +1064,7 @@ class Daemon:
 
     def _revise_in_place(self, fut, pasted: str, target_app, bundle: str,
                          mode: str, raw: str, t0: float,
-                         rec_id: str | None = None) -> None:
+                         rec_id: str | None = None) -> str | None:
         """Second-chance cleanup: replace the instant paste with Haiku's
         version — but only when it is provably safe.
 
@@ -993,6 +1181,7 @@ class Daemon:
                                latency_ms=ms)
         except Exception:
             pass
+        return improved
 
 
     def _cancel_pending_stop(self) -> bool:
@@ -1095,6 +1284,9 @@ class Daemon:
             with self._lock:
                 self.recording = False
             self.hands_free = False
+            if self._incremental is not None:
+                self._incremental.stop()
+                self._incremental = None
             self.recorder.stop()
         except Exception:
             pass
@@ -1160,6 +1352,16 @@ class Daemon:
                     is_down = bool(Quartz.CGEventGetFlags(event) & FN)
                     if is_down != down[0]:
                         down[0] = is_down
+                        if is_down:
+                            # Sample the front app HERE, on the event
+                            # thread, before the worker hop and before
+                            # macOS's own globe-key action can move focus.
+                            try:
+                                self._front_at_press = \
+                                    modes_mod.frontmost_app()
+                                self._front_at_press_t = time.time()
+                            except Exception:
+                                self._front_at_press = None
                         events.put(is_down)
                 except Exception as e:
                     # Same contract as the pynput guards: never let an
@@ -1212,6 +1414,11 @@ class Daemon:
 
         def on_press(key):  # noqa: ANN001
             if key == keyboard.Key.alt_r:
+                try:
+                    self._front_at_press = modes_mod.frontmost_app()
+                    self._front_at_press_t = time.time()
+                except Exception:
+                    self._front_at_press = None
                 self._hotkey_down()
 
         def on_release(key):  # noqa: ANN001
@@ -1250,13 +1457,7 @@ class Daemon:
             # down. Rebuild rather than fall out of run() into a live-but-
             # deaf process. Any recording in flight is abandoned first so
             # the new listener starts from a known state.
-            try:
-                with self._lock:
-                    self.recording = False
-                self.hands_free = False
-                self.recorder.stop()
-            except Exception:
-                pass
+            self._abandon_in_flight()
             print("[wispr] hotkey listener stopped — restarting in 2 s",
                   flush=True)
             time.sleep(2.0)

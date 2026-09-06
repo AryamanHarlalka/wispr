@@ -91,24 +91,62 @@ Only the transcribed **text** is ever sent, and only when a key is present.
 
 | | |
 |---|---|
-| **Dictate** | Hold Right Option, speak, release |
-| **Hands-free** | Double-tap Right Option; tap once to stop |
+| **Dictate** | Hold Right Option (or the Fn/globe key, see below), speak, release |
+| **Hands-free** | Double-tap the hotkey; tap once to stop |
+| **Teach it a word** | `wispr add Anika "Wispr Flow"` |
 | **Fix a word it keeps mishearing** | `wispr fix "wrong" "right"` |
-| **See recent dictations** | `wispr history` |
+| **See what it knows** | `wispr words` · `wispr forget <term>` |
+| **See recent dictations** | `wispr history` · `wispr last` |
 | **Check what's wrong** | `wispr doctor` |
 | **Restart it** | `wispr restart` |
 
-Text appears almost immediately — the local result pastes right away, then
-quietly refines itself a moment later if the cleanup pass improves on it. You
-generally won't notice the second step, and it turns itself off in code editors
-and terminals, where auto-indent and autocomplete make rewriting unsafe.
+The pill at the bottom of the screen shows what is happening — a live
+waveform while you speak, then transcribing, cleaning, pasted. It floats over
+full-screen apps too, without pulling you out of them.
 
-Prefer the text to land once and never change?
+### It learns
+
+Wispr keeps a personal dictionary (`~/.wispr/dictionary.txt`) that biases
+both the speech model and the cleanup pass toward *your* names, products and
+jargon. It fills itself in three ways:
+
+1. **You tell it** — `wispr add <word>` or `wispr fix <wrong> <right>`.
+2. **You correct it** — a few seconds after a paste, Wispr looks at the text
+   field it pasted into (Accessibility API, local, read-only). If you changed
+   "Whisper" to "Wispr" or "docked X" to "docx", it remembers.
+3. **The cleanup pass corrects it** — when Claude replaces a misheard word
+   with one of your known terms, the pair is remembered so the speech model
+   is biased toward it next time.
+
+Learned pairs are hints, not blind replacements: they steer the speech model
+and are shown to the cleanup pass, which applies them where the context fits.
+Your own `wispr fix` entries are applied verbatim. `wispr words` shows all of
+it; `wispr forget <term>` removes an entry.
+
+### Fn / globe key as the hotkey
 
 ```toml
 # ~/.wispr/config.toml
+[hotkey]
+key = "fn"
+```
+
+Then set System Settings → Keyboard → *Press globe key to* → **Do Nothing**,
+or the emoji picker opens on every dictation (`wispr doctor` checks this).
+
+### Latency vs. polish
+
+By default the cleanup pass runs *before* the paste, under a hard 2-second
+budget, so what lands is finished text. Short dictations (under four words)
+skip it and land instantly; if the network is slow the local result pastes
+instead. Would you rather have rougher text a second sooner?
+
+```toml
 [paste]
-revise = false
+instant = true      # paste the local result immediately
+revise = true       # …and let the cleanup pass rewrite it in place (guarded)
+[cleanup]
+wait_s = 2.0        # how long the paste may wait for the cleanup pass
 ```
 
 ---
@@ -120,10 +158,12 @@ committed or uploaded.
 
 | File | What it does |
 |---|---|
-| `config.toml` | backend, model, paste behaviour |
+| `config.toml` | hotkey, backend, model, paste and cleanup behaviour |
 | `snippets.toml` | say "my email", get your email address |
-| `corrections.tsv` | permanent fixes for words it mishears |
-| `seed-terms.txt` | names and jargon to recognise (one per line) |
+| `dictionary.txt` | your names and jargon — `wispr add`, or learned |
+| `corrections.tsv` | your verbatim fixes — `wispr fix` |
+| `learned.tsv` | mishearings Wispr observed, used as hints |
+| `seed-terms.txt` | extra terms to seed the vault vocabulary (one per line) |
 | `modes.toml` | per-app tone — casual in Slack, precise in editors |
 | `history.jsonl` | every dictation, local only |
 
@@ -146,8 +186,8 @@ wispr doctor
 ```
 
 It checks for duplicate daemons, a dead hotkey listener, missing permissions, a
-wedged microphone, a broken model and an invalid key — and prints the exact
-command to fix whatever it finds. Start here; it usually saves the debugging.
+wedged microphone, the globe-key setting, a broken model and an invalid key —
+and prints the exact command to fix whatever it finds. Start here; it usually saves the debugging.
 
 Logs, if you want them: `~/.wispr/logs/daemon.err.log`
 
@@ -163,15 +203,17 @@ Logs, if you want them: `~/.wispr/logs/daemon.err.log`
 ## How it works
 
 ```
-Right Option held  →  record (locally)
-                   →  transcribe (locally, Whisper)
-                   →  clean up (local rules; Haiku if you added a key)
-                   →  paste at your cursor
+hotkey held  →  record (locally)
+             →  transcribe (locally, Whisper, biased by your dictionary)
+             →  clean up (Claude Haiku if you added a key; local rules otherwise)
+             →  paste at your cursor
+             →  learn from what you change
 ```
 
-Transcription decodes *while you're still speaking*, so a long dictation doesn't
-pay for the whole recording when you let go. Cleanup happens after the paste,
-not before it, so the network is never between you and your text.
+Transcription decodes *while you're still speaking*, in bounded chunks cut at
+natural pauses, so a long dictation only pays for its last few seconds when you
+let go. Cleanup runs under a hard time budget and falls back to local rules, so
+the network can never hold your text hostage.
 
 **Backends are chosen per machine**, because the right answer is hardware
 dependent — MLX on the Apple GPU where that exists, CTranslate2 on CPU where it

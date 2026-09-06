@@ -48,6 +48,8 @@ def make_daemon():
     dm._last_release = 0.0
     dm.indicator = FakeInd()
     dm.vocab = []; dm.modes = {}; dm.snippets = {}; dm.corrections = {}
+    dm.dictionary = []; dm._edit_watcher = None
+    dm._front_at_press = None; dm._front_at_press_t = 0.0
     dm.recorder = DeadRecorder()
     return dm
 

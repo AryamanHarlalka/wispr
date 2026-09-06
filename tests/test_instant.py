@@ -57,6 +57,8 @@ def make_daemon():
     dm._dictation_seq = 1
     dm.indicator = FakeInd()
     dm.vocab = []; dm.modes = {}; dm.snippets = {}; dm.corrections = {}
+    dm.dictionary = []; dm._edit_watcher = None
+    dm._front_at_press = None; dm._front_at_press_t = 0.0
     dm.recorder = types.SimpleNamespace(level=0.0, start=lambda: None,
                                         stop=lambda: None)
     return dm

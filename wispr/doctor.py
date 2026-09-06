@@ -483,6 +483,39 @@ def check_microphone() -> None:
               "second wispr daemon is running (see the duplicate check above).")
 
 
+def check_globe_key() -> None:
+    """The Fn/globe hotkey collides with macOS's own "Press globe key to"
+    action unless that action is set to Do Nothing.
+
+    Wispr's Fn tap is listen-only, so the system ALSO runs whatever the
+    globe key is bound to on the same press: the emoji picker, Mission
+    Control, Show Desktop, or an input-source switch. Whichever it is takes
+    focus away from the app the user was dictating into.
+    """
+    if hotkey() != "fn":
+        return
+    try:
+        out = subprocess.run(
+            ["defaults", "read", "com.apple.HIToolbox", "AppleFnUsageType"],
+            capture_output=True, text=True, timeout=5)
+        val = out.stdout.strip() if out.returncode == 0 else ""
+    except Exception:
+        return  # not fatal; never let a diagnostic break the run
+    names = {"0": "Do Nothing", "1": "Change Input Source",
+             "2": "Show Emoji & Symbols", "3": "Start Dictation"}
+    if val == "0":
+        _emit("ok", "Globe key is free for Wispr (Press globe key to: Do Nothing)")
+        return
+    what = names.get(val, "its default action")
+    _emit("fail", f"macOS still owns the globe key (set to: {what})",
+          "Every Fn press fires that system action as well as Wispr's, so "
+          "focus jumps out of whatever you were typing in and the paste can "
+          "land in the wrong window.",
+          "defaults write com.apple.HIToolbox AppleFnUsageType -int 0 "
+          "(then log out and back in), or System Settings > Keyboard > "
+          "Press globe key to > Do Nothing")
+
+
 def check_key() -> None:
     key = anthropic_key()
     if not key:
@@ -531,6 +564,17 @@ def check_config() -> None:
                 f"revise: {'on' if paste_revise() else 'off'} "
                 f"({revise_window_s():.1f}s window)")
     _emit("ok", f"Vocabulary: {n} terms" + (f" · vault: {VAULT}" if VAULT else ""))
+    try:
+        from . import dictionary
+        from .config import cleanup_wait_s, learn_from_edits, load_corrections
+        _emit("ok", f"Dictionary: {len(dictionary.load_dictionary())} words · "
+                    f"{len(load_corrections())} fixes · "
+                    f"{len(dictionary.load_learned())} learned · "
+                    f"learning from edits: {'on' if learn_from_edits() else 'off'} · "
+                    f"cleanup budget: {cleanup_wait_s():.1f}s")
+    except Exception as e:
+        _emit("warn", "Could not read the dictionary",
+              f"{e.__class__.__name__}: {str(e)[:80]}")
 
 
 def main() -> None:
@@ -538,7 +582,7 @@ def main() -> None:
     for fn in (check_duplicates, check_listener_alive, check_accessibility,
                check_mic_contention, check_mic_entitlement,
                check_microphone, check_model,
-               check_key, check_config):
+               check_globe_key, check_key, check_config):
         try:
             fn()
         except Exception as e:  # a broken check must not hide the others

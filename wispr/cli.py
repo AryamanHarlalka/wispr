@@ -12,8 +12,11 @@ USAGE = """wispr — local voice dictation for macOS
   wispr set-key             store an Anthropic API key in your keychain
   wispr set-key --clear     remove it (falls back to local rules cleanup)
   wispr restart             restart the background service
+  wispr add <word> [...]    add words to your personal dictionary
   wispr fix <wrong> <right> teach it a word it keeps mishearing
-  wispr vocab               rebuild the vocabulary list
+  wispr words               show your dictionary and learned corrections
+  wispr forget <term>       remove a dictionary word or a correction
+  wispr vocab               rebuild the vault vocabulary list
   wispr history [n]         show recent dictations
   wispr last                reprint the last dictation and copy it back
   wispr last --no-copy      print it without touching the clipboard
@@ -204,9 +207,54 @@ def main() -> None:
         if len(args) != 3:
             print("usage: wispr fix <wrong> <right>")
             sys.exit(1)
-        from .config import add_correction
-        add_correction(args[1], args[2])
-        print(f"[wispr] correction saved: '{args[1]}' -> '{args[2]}'")
+        from . import dictionary
+        if dictionary.record_correction(args[1], args[2]):
+            dictionary.add_words([args[2]])
+            print(f"[wispr] correction saved: '{args[1]}' -> '{args[2]}' "
+                  f"(applies from the next dictation)")
+        else:
+            print(f"[wispr] not saved — already known, or '{args[1]}' is "
+                  f"itself a dictionary word")
+    elif cmd == "add":
+        if len(args) < 2:
+            print("usage: wispr add <word> [<word> ...]   (quote multi-word terms)")
+            sys.exit(1)
+        from . import dictionary
+        added = dictionary.add_words(args[1:])
+        skipped = [w for w in args[1:] if w not in added]
+        if added:
+            print(f"[wispr] added: {', '.join(added)}")
+        if skipped:
+            print(f"[wispr] already there or not a word: {', '.join(skipped)}")
+    elif cmd in ("words", "dictionary", "dict"):
+        from . import dictionary
+        from .config import load_corrections
+        words = dictionary.load_dictionary()
+        corr = load_corrections()
+        learned = dictionary.load_learned()
+        print(f"Dictionary ({len(words)}):")
+        for w in words:
+            print(f"  {w}")
+        print(f"\nYour corrections, applied verbatim ({len(corr)}):")
+        for wrong, right in corr.items():
+            print(f"  {wrong!r:28} -> {right}")
+        print(f"\nLearned from your edits and cleanup, used as hints "
+              f"({len(learned)}):")
+        for wrong, right in learned.items():
+            print(f"  {wrong!r:28} -> {right}")
+        print("\nadd: wispr add <word>   fix: wispr fix <wrong> <right>   "
+              "remove: wispr forget <term>")
+    elif cmd == "forget":
+        if len(args) < 2:
+            print("usage: wispr forget <term>")
+            sys.exit(1)
+        from . import dictionary
+        term = " ".join(args[1:])
+        a = dictionary.remove_word(term)
+        b = dictionary.remove_correction(term)
+        c = dictionary.remove_learned(term)
+        print(f"[wispr] forgot '{term}'" if (a or b or c)
+              else f"[wispr] '{term}' was not in the dictionary or corrections")
     elif cmd == "vocab":
         from .vocab import write_vocab
         p = write_vocab()

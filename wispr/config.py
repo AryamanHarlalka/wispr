@@ -98,6 +98,7 @@ def ensure_home() -> None:
         snippets.write_text(DEFAULT_SNIPPETS)
     (WISPR_HOME / "corrections.tsv").touch()
     (WISPR_HOME / "history.jsonl").touch()
+    (WISPR_HOME / "dictionary.txt").touch()
 
 
 def load_modes() -> dict[str, str]:
@@ -115,10 +116,12 @@ def load_snippets() -> dict[str, str]:
 def load_corrections() -> dict[str, str]:
     ensure_home()
     out: dict[str, str] = {}
-    for line in (WISPR_HOME / "corrections.tsv").read_text().splitlines():
-        if "\t" in line:
+    for line in (WISPR_HOME / "corrections.tsv").read_text(
+            encoding="utf-8", errors="ignore").splitlines():
+        if "\t" in line and not line.startswith("#"):
             wrong, right = line.split("\t", 1)
-            out[wrong.strip()] = right.strip()
+            if wrong.strip() and right.strip():
+                out[wrong.strip()] = right.strip()  # last write wins
     return out
 
 
@@ -328,7 +331,16 @@ def hotkey() -> str:
 
 
 def paste_instant() -> bool:
-    """Instant-paste mode (2026-07-30). ON by default.
+    """Instant-paste mode (2026-07-30). OFF by default since 2026-09-06.
+
+    2026-09-06: with `paste.revise` off (its safe default) instant mode
+    meant the LLM cleanup never reached the screen at all — every
+    dictation pasted the local rules result and stopped. The daily
+    complaint became quality, not latency, and the cleanup call measures
+    0.8-1.5 s on a warm connection, so cleanup is back on the critical
+    path under a hard budget (`cleanup.wait_s`). Turn instant mode back
+    on with [paste] instant = true if you would rather have rougher text
+    a second sooner.
 
     Old behaviour: transcribe -> wait for Haiku cleanup (up to 2.5 s) ->
     paste. Cleanup sat on the critical path, so every long dictation paid
@@ -342,7 +354,7 @@ def paste_instant() -> bool:
     whole cleanup step.
 
     Disable with [paste] instant = false in ~/.wispr/config.toml."""
-    return _bool_knob("WISPR_PASTE_INSTANT", "paste", "instant", True)
+    return _bool_knob("WISPR_PASTE_INSTANT", "paste", "instant", False)
 
 
 def paste_revise() -> bool:
@@ -370,6 +382,38 @@ def paste_revise() -> bool:
         revise = true
     """
     return _bool_knob("WISPR_PASTE_REVISE", "paste", "revise", False)
+
+
+def cleanup_wait_s() -> float:
+    """How long the paste may wait for the LLM cleanup before falling back
+    to the local rules result. 2.0 s covers the observed 0.8-1.5 s spread
+    with headroom for a slow network moment; a short dictation (<4 words)
+    never waits at all.
+
+        [cleanup]
+        wait_s = 2.0
+    """
+    return _float_knob("WISPR_CLEANUP_WAIT_S", "cleanup", "wait_s", 2.0)
+
+
+def learn_from_edits() -> bool:
+    """Learn corrections by looking at the pasted text field a few seconds
+    after the paste (Accessibility API, local, read-only). ON by default.
+
+        [learn]
+        from_edits = true
+    """
+    return _bool_knob("WISPR_LEARN_FROM_EDITS", "learn", "from_edits", True)
+
+
+def learn_from_llm() -> bool:
+    """Learn a correction whenever the cleanup model replaces a word with
+    one of your known dictionary terms. ON by default.
+
+        [learn]
+        from_llm = true
+    """
+    return _bool_knob("WISPR_LEARN_FROM_LLM", "learn", "from_llm", True)
 
 
 def revise_window_s() -> float:

@@ -26,3 +26,7 @@ bench/dumps/
 
 # App bundle built by install/build-app.sh (goes to ~/Applications).
 build/
+
+# Editor/scratch leftovers
+*.bak
+.exp/
