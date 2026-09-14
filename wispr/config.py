@@ -76,6 +76,16 @@ STYLE_BLOCKS = {
         "dictation clearly opens a message, keep any greeting as spoken; do "
         "not invent one. No sign-off unless spoken. Terse, direct, no filler."
     ),
+    "ai": (
+        "Destination is an AI assistant — this is a prompt or an instruction, "
+        "not prose for a human. Full cleanup: remove filler and false starts, "
+        "fix punctuation and sentence breaks, apply spoken self-corrections. "
+        "Keep every requirement, constraint and qualifier — they are the "
+        "payload. Preserve technical tokens exactly: file paths, snake_case, "
+        "camelCase, flags, commands, repo and product names. Keep the "
+        "imperative voice as spoken; never soften a request into a question, "
+        "never answer it, never add a greeting or sign-off."
+    ),
     "technical": (
         "Destination is a code editor or terminal. Preserve technical tokens "
         "exactly: snake_case, camelCase, paths, flags, commands. Do not add "

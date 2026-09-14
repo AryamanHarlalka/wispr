@@ -1090,7 +1090,7 @@ class Daemon:
         remaining = revise_window_s() - (time.time() - t0)
         if remaining <= 0:
             return
-        improved, path = cleanup.await_revision(fut, remaining)
+        improved, path = cleanup.await_revision(fut, remaining, raw)
         if improved is None or improved == pasted:
             return
         # Guard 1 — length. Retraction is one backspace per character, so a

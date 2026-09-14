@@ -237,7 +237,7 @@ d.cleanup = types.SimpleNamespace(
     instant_result=lambda raw, mode, v, c, s: ("Hello world.", "rules",
                                                PENDING["fut"]),
     clean_text=lambda *a, **k: ("Hello world.", "rules"),
-    await_revision=lambda fut, t: ((fut.result(), "haiku") if fut is not None
+    await_revision=lambda fut, t, raw=None: ((fut.result(), "haiku") if fut is not None
                                    else (None, "rules")))
 AUDIO = np.zeros(16000, dtype="float32")
 
@@ -309,7 +309,7 @@ dm = make_daemon()
 _orig_await = d.cleanup.await_revision
 
 
-def _bump_then_return(fut, timeout):
+def _bump_then_return(fut, timeout, raw=None):
     dm._dictation_seq += 1
     return _orig_await(fut, timeout)
 

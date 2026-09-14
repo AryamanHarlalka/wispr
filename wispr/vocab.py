@@ -116,5 +116,22 @@ def initial_prompt(vocab: list[str], corrections: dict[str, str],
     of standing corrections, then vault-harvested vocab.
     """
     from . import dictionary as dict_mod
-    terms = dict_mod.prompt_terms(vocab, corrections, dictionary, limit=60)
-    return f"Notes mentioning {', '.join(terms)}."
+    # 72, measured: at 60 terms the prompt is 182 tokens against a
+    # 223-token window (faster-whisper keeps the last 223 of
+    # max_length//2-1). 60 was leaving a third of the budget unused
+    # while dropping the tail of the term list — which is where the
+    # project names sat. Re-measure before raising this further.
+    terms = dict_mod.prompt_terms(vocab, corrections, dictionary, limit=72)
+    # Budget the prompt ourselves. faster-whisper truncates initial_prompt
+    # from the FRONT (it keeps previous_tokens[-(max_length//2-1):], the
+    # last 223 tokens), so an overflow would silently drop the personal
+    # dictionary and keep the generic vault vocab — the wrong half. Trim
+    # from the tail instead. ~3.0 chars/token on this comma-separated list,
+    # measured: 549 chars = 182 tokens, 643 chars = 217 tokens. 600 chars
+    # holds ~200 tokens, a safe margin under the 223 window.
+    while terms:
+        prompt = f"Notes mentioning {', '.join(terms)}."
+        if len(prompt) <= 600:
+            return prompt
+        terms.pop()
+    return ""

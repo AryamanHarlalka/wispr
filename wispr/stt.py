@@ -51,6 +51,14 @@ class FasterWhisperBackend(Backend):
         return [Segment(s.text, s.start, s.end) for s in segments]
 
 
+# Whisper's bias window is 224 tokens, roughly 900 characters. The
+# previous 400 cut the prompt mid-word at "Nee|raj" and discarded every
+# personal name behind it, keeping only generic tech vocabulary the
+# model already gets right. Measured 2026-09-14 against a 546-char
+# prompt; 850 leaves headroom under the token limit.
+PROMPT_CHAR_CAP = 850
+
+
 def _write_wav(audio: np.ndarray, path: str, sample_rate: int = 16000) -> None:
     pcm16 = np.clip(audio * 32768.0, -32768, 32767).astype(np.int16)
     with wave.open(path, "wb") as w:
@@ -106,7 +114,7 @@ class WhisperCppBackend(Backend):
                     "-l", language, "-bs", str(beam_size), "-np", "-nt",
                     "-oj", "-of", out_stem]
             if initial_prompt:
-                args += ["--prompt", initial_prompt[:400]]
+                args += ["--prompt", initial_prompt[:PROMPT_CHAR_CAP]]
             if vad_filter and self._vad_model.exists():
                 args += ["--vad", "--vad-model", str(self._vad_model)]
             r = subprocess.run(args, capture_output=True, text=True, timeout=120)

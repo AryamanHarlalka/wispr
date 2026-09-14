@@ -131,7 +131,7 @@ dm = make_daemon()
 sent["backspaces"] = 0; sent["pasted"] = []
 dm._dictation_seq = 5  # a newer dictation started after we captured seq
 orig_await = cleanup.await_revision
-def bump_then_return(fut, timeout):
+def bump_then_return(fut, timeout, raw=None):
     dm._dictation_seq += 1
     return orig_await(fut, timeout)
 cleanup.await_revision = bump_then_return
