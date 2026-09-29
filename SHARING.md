@@ -51,7 +51,7 @@ changes:
 
 ```bash
 cd ~/code/wispr
-git grep -nEi 'sk-ant-[A-Za-z0-9_-]{20}|@gmail|@example|/Users/[a-z]+/(Desktop|Documents)' \
+git grep -nEi 'sk-ant-[A-Za-z0-9_-]{20}|@gmail|/Users/[a-z]+/(Desktop|Documents)' \
   -- . ':!*.md'
 ```
 

@@ -83,7 +83,7 @@ check("a plural edit is not a mishearing", S("send the report", "send the report
 check("a similar-looking verb swap is not learned", S("ship it now", "skip it now") == [])
 check("a one-token paste can still be learned from",
       learn.substitutions("Firecral", "Firecrawl") == [("Firecral", "Firecrawl")])
-check("case-only change is not a mishearing", S("the parallel deck", "the Atlas deck") == [])
+check("case-only change is not a mishearing", S("the atlas deck", "the Atlas deck") == [])
 check("whole-sentence rewrite is ignored (alignment gate)",
       S("please fix the login bug today", "can you look at authentication tomorrow") == [])
 check("numbers are never learned", S("we need 2 more", "we need 3 more") == [])
