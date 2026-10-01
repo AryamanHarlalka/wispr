@@ -6,6 +6,7 @@ KeepAlive never fires and the daemon sits there holding a healthy PID while
 the hotkey does nothing. These tests assert that an audio failure can never
 reach the callback, and that state is reset so the next press retries.
 """
+import os as _os; _os.environ["WISPR_CLOUD_STT"] = "0"  # tests never call the cloud
 import sys
 import threading
 

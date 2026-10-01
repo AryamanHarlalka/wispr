@@ -231,3 +231,30 @@ doesn't. Measured rather than assumed: see [BENCHMARKS.md](BENCHMARKS.md).
 ## Licence
 
 MIT — see [LICENSE](LICENSE).
+
+## Cloud speech model (default when a key is present)
+
+Local `base.en` on an Intel CPU tops out around 15–20% word error rate on
+accented speech. With an OpenAI key, Wispr sends each take to
+`gpt-4o-transcribe`, primed with your personal dictionary and your last
+dictation into the same app, while the local model decodes in parallel as
+the offline fallback. On the bench clips that cut WER from 0.185 to 0.037
+and was faster than local decoding (0.7–1.4 s vs 1.3–7 s).
+
+```
+security add-generic-password -U -s wispr-openai -a "$USER" -w   # paste key
+```
+
+`~/.wispr/config.toml`:
+
+```toml
+[stt]
+cloud = true                      # false = fully on-device
+cloud_model = "gpt-4o-transcribe" # or gpt-4o-mini-transcribe (half price)
+speaker = "Sam is dictating in Indian-accented English, often softly"
+```
+
+Quiet takes are lifted toward −3 dBFS (gain capped at +24 dB) before upload.
+The newest 150 takes are kept as WAVs in `~/.wispr/audio/` (local only) so
+model changes can be measured on real speech. Every history record carries
+`stt` (`cloud:…` or `local`) and `stt_note`.

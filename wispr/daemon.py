@@ -19,7 +19,7 @@ from pathlib import Path
 
 import numpy as np
 
-from . import (cleanup, dictionary as dict_mod, history, learn as learn_mod,
+from . import (cleanup, cloud_stt, dictionary as dict_mod, history, learn as learn_mod,
                modes as modes_mod, stt, vocab as vocab_mod)
 from .config import (WISPR_HOME, cleanup_wait_s, ensure_home, learn_from_edits,
                      learn_from_llm, load_corrections, load_modes,
@@ -690,6 +690,47 @@ class IncrementalTranscriber:
             return None
 
 
+import concurrent.futures as _cf
+
+_STT_POOL = _cf.ThreadPoolExecutor(max_workers=3, thread_name_prefix="wispr-stt")
+AUDIO_KEEP = 150
+
+
+def _cleanup_budget(raw: str) -> float:
+    """Long dictations need longer to clean. A flat 2.0 s budget made 22%
+    of the last 200 dictations (every one over ~90 words) skip cleanup
+    entirely and paste raw. Haiku writes ~150 tokens/s, so scale with
+    length: 60 words -> 2.0 s, 200 -> 3.6 s, 350 -> 5.4 s, capped at 7 s."""
+    words = len((raw or "").split())
+    return min(7.0, max(cleanup_wait_s(), 1.2 + 0.012 * words))  # newest N dictations kept as WAV, local only, for A/B + learning
+
+
+def _save_audio_async(rec_id, audio: np.ndarray) -> None:
+    """Keep the last AUDIO_KEEP takes in ~/.wispr/audio/<id>.wav so model
+    changes can be measured on the owner's real speech instead
+    of three bench clips. Local only; never uploaded anywhere."""
+    if not rec_id or audio is None or audio.size == 0:
+        return
+
+    def _w() -> None:
+        try:
+            import wave
+            d = WISPR_HOME / "audio"
+            d.mkdir(parents=True, exist_ok=True)
+            with wave.open(str(d / f"{rec_id}.wav"), "wb") as w:
+                w.setnchannels(1)
+                w.setsampwidth(2)
+                w.setframerate(SAMPLE_RATE)
+                w.writeframes((np.clip(audio, -1, 1) * 32767)
+                              .astype(np.int16).tobytes())
+            files = sorted(d.glob("*.wav"), key=lambda p: p.stat().st_mtime)
+            for old in files[:-AUDIO_KEEP]:
+                old.unlink(missing_ok=True)
+        except Exception as e:
+            print(f"[wispr] audio save failed: {e}", flush=True)
+    threading.Thread(target=_w, daemon=True).start()
+
+
 class Daemon:
     def __init__(self, indicator: Indicator | None = None) -> None:
         ensure_home()
@@ -803,6 +844,7 @@ class Daemon:
         # Open the TLS connection while the user is still speaking so the
         # Haiku call after key-release starts on a warm connection (B1).
         cleanup.prewarm_connection()
+        cloud_stt.prewarm()
         self.recorder.start()
         # B3: start decoding in the background while the user keeps
         # talking, so long (hands-free) dictations only pay for the tail
@@ -861,13 +903,11 @@ class Daemon:
                           args=(audio, target_app, incremental),
                           daemon=True).start()
 
-    def _process(self, audio: np.ndarray, target_app=None,
-                 incremental: "IncrementalTranscriber | None" = None) -> None:
-        t0 = time.time()
-        bundle = modes_mod.bundle_id_of(target_app)
-        mode = modes_mod.mode_for(bundle, self.modes)
+    def _local_transcribe(self, audio: np.ndarray,
+                          incremental: "IncrementalTranscriber | None") -> str:
+        """The on-device path (base.en). Fallback for cloud STT and the
+        whole story when offline. Never raises."""
         try:
-            self.indicator.set("transcribing")
             raw = None
             if incremental is not None:
                 try:
@@ -884,7 +924,65 @@ class Daemon:
                         condition_on_previous_text=CONDITION_ON_PREVIOUS_TEXT,
                     )
                 raw = " ".join(s.text.strip() for s in segments).strip()
+            return raw
+        except Exception as e:
+            print(f"[wispr] local stt failed: {e.__class__.__name__}: {e}",
+                  flush=True)
+            return ""
+
+    def _recent_context(self, bundle: str) -> str:
+        """The previous dictation into the same app within 3 minutes —
+        continuity for the speech model (names, casing, topic)."""
+        last = getattr(self, "_last_text", None)
+        if not last:
+            return ""
+        b, ts, text = last
+        if b != bundle or time.time() - ts > 180:
+            return ""
+        return text or ""
+
+    def _process(self, audio: np.ndarray, target_app=None,
+                 incremental: "IncrementalTranscriber | None" = None) -> None:
+        t0 = time.time()
+        bundle = modes_mod.bundle_id_of(target_app)
+        mode = modes_mod.mode_for(bundle, self.modes)
+        try:
+            self.indicator.set("transcribing")
+            # 2026-10-01: cloud STT first (~5x lower WER on the owner's voice,
+            # faster than base.en on an Intel CPU), with the local model
+            # decoding in parallel as the fallback. See cloud_stt.py.
+            dur_s = audio.size / SAMPLE_RATE
+            stt_engine, stt_note = "local", ""
+            cloud_fut = None
+            if cloud_stt.enabled():
+                try:
+                    prompt = cloud_stt.build_prompt(
+                        dict_mod.prompt_terms(self.vocab, self.corrections,
+                                              self.dictionary, limit=150),
+                        self._recent_context(bundle))
+                    cloud_fut = _STT_POOL.submit(cloud_stt.transcribe,
+                                                 audio, prompt)
+                except Exception as e:
+                    stt_note = f"cloud submit failed: {e}"
+            local_fut = _STT_POOL.submit(self._local_transcribe, audio,
+                                         incremental)
+            raw = None
+            if cloud_fut is not None:
+                try:
+                    text, stt_note = cloud_fut.result(
+                        timeout=cloud_stt.wait_s(dur_s))
+                except Exception:
+                    text, stt_note = None, "timeout"
+                if text:
+                    raw, stt_engine = text, f"cloud:{cloud_stt.model()}"
+                else:
+                    print(f"[wispr] cloud stt -> local ({stt_note})",
+                          flush=True)
+            if raw is None:
+                raw = local_fut.result()
             t_whisper = time.time()
+            if stt_engine == "local" and not raw:
+                raw = ""
             if not raw:
                 # "heard nothing" has two very different causes and used to
                 # report both identically, which is why a dead microphone
@@ -929,7 +1027,7 @@ class Daemon:
                     # screen is the finished text.
                     cleaned, path = cleanup.clean_text(
                         raw, mode, self.vocab, self.corrections, self.snippets,
-                        budget_s=cleanup_wait_s())
+                        budget_s=_cleanup_budget(raw))
             except Exception as e:
                 print(f"[wispr] cleanup raised, pasting raw transcript: "
                       f"{e.__class__.__name__}: {e}", flush=True)
@@ -950,7 +1048,8 @@ class Daemon:
                     int((t_clean - t0) * 1000), stages={
                         "whisper_ms": (t_whisper - t0) * 1000,
                         "cleanup_ms": (t_clean - t_whisper) * 1000,
-                    })
+                    }, extra={"stt": stt_engine, "stt_note": stt_note[:120]})
+                _save_audio_async(rec_id, audio)
             except Exception as e:
                 print(f"[wispr] could not write history before the paste: "
                       f"{e.__class__.__name__}: {e}", flush=True)
@@ -987,6 +1086,7 @@ class Daemon:
                     if improved:
                         final, final_path = improved, "haiku"
                 # Learning looks at what is actually on screen now.
+                self._last_text = (bundle, time.time(), final)
                 self._after_paste(final, raw, final_path, target_app)
             finally:
                 _end_revision_window()

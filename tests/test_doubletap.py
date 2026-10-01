@@ -18,6 +18,7 @@ fake pynput Listener -- and assert the four behaviours that matter:
 Timings are scaled off the real constants, so retuning them cannot silently
 invalidate the suite.
 """
+import os as _os; _os.environ["WISPR_CLOUD_STT"] = "0"  # tests never call the cloud
 import os
 import sys
 import threading

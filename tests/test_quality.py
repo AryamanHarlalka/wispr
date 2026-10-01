@@ -4,6 +4,7 @@ must stay bounded no matter how long the dictation is.
 
 Run:  PYTHONPATH=$PWD .venv/bin/python tests/test_quality.py
 """
+import os as _os; _os.environ["WISPR_CLOUD_STT"] = "0"  # tests never call the cloud
 import os
 import sys
 import tempfile

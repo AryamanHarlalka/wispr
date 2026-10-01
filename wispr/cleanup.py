@@ -126,8 +126,10 @@ def match_snippet(text: str, snippets: dict[str, str]) -> str | None:
 _STATIC_RULES = """You clean up voice dictation transcripts so they read as if the speaker had typed them. Rules:
 - Remove filler and disfluencies (um, uh, you know, I mean, like, sort of, kind of, right?, okay so) ONLY where they carry no meaning. Remove stutters and false starts ("I want- I want to" -> "I want to").
 - Fix punctuation, capitalisation and sentence breaks. Keep the speaker's words, order, tone and first-person voice: do not paraphrase, shorten, summarise, or "improve" wording.
+- Keep every sentence and clause the speaker said, including hedges and asides ("I think", "go ahead and", "first of all", questions to themselves). Never turn a statement or a question into a command, and never condense several sentences into one. Apart from removed filler, the output should be about as long as the input.
 - Apply spoken self-corrections: "2, actually 3" -> "3"; "Tuesday, no wait, Wednesday" -> "Wednesday"; "send it to Sam, sorry, to Lee" -> "send it to Lee".
 - Apply spoken formatting commands: "new paragraph", "new line", "quote ... unquote", "all caps that".
+- Accented or softly spoken speech produces sound-alike errors: v/w swaps, dropped or merged syllables, a short name heard as a common word (e.g. "eye phone" for "iPhone"). Fix a word only when a known term fits both the sound and the sentence.
 - The transcript comes from speech recognition, so words may be misheard. If a word or short phrase is a plausible mishearing of one of the known terms below (e.g. "eye phone" for "iPhone", "wispa flow" for "Wispr Flow", "docked X" for "docx"), replace it with the known term's exact spelling. Only substitute when the sound is genuinely close; never force a term in.
 - When the speaker is clearly dictating a list ("first ... second ... third", "one ... two ...", "the following: X, Y, and Z" as parallel items), format it as a list: "- " bullets, or "1." numbers if the speaker numbered them. Keep prose as prose.
 - Keep numbers, emails, URLs, file names and code identifiers exactly as spoken; write numbers as digits when they are quantities, dates or times.
@@ -236,7 +238,11 @@ def _haiku_messages(transcript: str, mode: str, vocab: list[str],
         "cache_control": {"type": "ephemeral"},
     }]
     style = STYLE_BLOCKS.get(mode, STYLE_BLOCKS["neutral"])
-    user = f"Style for this destination: {style}\n\nTranscript:\n{transcript}"
+    from .cloud_stt import speaker_hint
+    hint = speaker_hint()
+    about = f"About the speaker: {hint}.\n" if hint else ""
+    user = (f"{about}Style for this destination: {style}\n\n"
+            f"Transcript:\n{transcript}")
     return system, user
 
 

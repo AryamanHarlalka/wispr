@@ -55,6 +55,9 @@ CLIP = {"text": None}
 d._pasteboard_read = lambda: CLIP["text"]
 d._pasteboard_write = lambda text: CLIP.__setitem__("text", text)
 d._send_cmd_v = lambda: None
+# Never call the cloud or write audio from a test.
+d.cloud_stt.enabled = lambda: False
+d._save_audio_async = lambda rec_id, audio: None
 d._activate_target = lambda app=None: None
 d._frontmost_pid = lambda: 4242  # same app still frontmost by default
 # Real timings would make this suite take half a minute of sleeping.
@@ -78,7 +81,7 @@ WRITES = {"n": 0}
 
 
 def fake_append(app, mode, raw, cleaned, path, latency_ms, stages=None,
-                rec_id=None):
+                rec_id=None, extra=None):
     WRITES["n"] += 1
     rid = rec_id or f"rec{len(STORE)}"
     STORE.append({"id": rid, "app": app, "mode": mode, "raw": raw,

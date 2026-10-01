@@ -23,7 +23,7 @@ from .config import WISPR_HOME, ensure_home
 
 def append(app: str, mode: str, raw: str, cleaned: str, path: str,
            latency_ms: int, stages: dict | None = None,
-           rec_id: str | None = None) -> str:
+           rec_id: str | None = None, extra: dict | None = None) -> str:
     """Write a new record and return its id, for later update().
 
     `stages` is optional per-stage latency, e.g.
@@ -40,6 +40,8 @@ def append(app: str, mode: str, raw: str, cleaned: str, path: str,
     }
     if stages:
         rec["stages"] = {k: int(v) for k, v in stages.items()}
+    if extra:
+        rec.update(extra)
     with open(WISPR_HOME / "history.jsonl", "a") as f:
         f.write(json.dumps(rec, ensure_ascii=False) + "\n")
     return rid

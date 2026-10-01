@@ -77,14 +77,16 @@ STYLE_BLOCKS = {
         "not invent one. No sign-off unless spoken. Terse, direct, no filler."
     ),
     "ai": (
-        "Destination is an AI assistant — this is a prompt or an instruction, "
-        "not prose for a human. Full cleanup: remove filler and false starts, "
-        "fix punctuation and sentence breaks, apply spoken self-corrections. "
-        "Keep every requirement, constraint and qualifier — they are the "
-        "payload. Preserve technical tokens exactly: file paths, snake_case, "
-        "camelCase, flags, commands, repo and product names. Keep the "
-        "imperative voice as spoken; never soften a request into a question, "
-        "never answer it, never add a greeting or sign-off."
+        "Destination is an AI assistant chat. Light-touch cleanup: the text "
+        "is the speaker's own message and must read in their voice. Remove "
+        "only true filler (um, uh, you know, stutters, false starts) and "
+        "apply explicit self-corrections. Keep everything else as spoken — "
+        "openers like 'hey', 'now', 'so', 'okay', polite questions ('can "
+        "you…'), hedges ('I think'), asides and rhetorical questions. Never "
+        "rephrase a question as a command, never merge or drop sentences, "
+        "never reorder. Fix misheard names, punctuation and sentence breaks. "
+        "Preserve technical tokens exactly: file paths, snake_case, "
+        "camelCase, flags, commands, repo and product names."
     ),
     "technical": (
         "Destination is a code editor or terminal. Preserve technical tokens "

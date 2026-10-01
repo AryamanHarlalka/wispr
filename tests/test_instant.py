@@ -4,6 +4,7 @@ These assert the SAFE behaviour: that a revision refuses to fire whenever
 it cannot prove it owns the cursor. A false negative costs slightly rougher
 text; a false positive deletes the user's own characters.
 """
+import os as _os; _os.environ["WISPR_CLOUD_STT"] = "0"  # tests never call the cloud
 import os
 import sys
 import threading
