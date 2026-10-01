@@ -369,6 +369,14 @@ def paste_instant() -> bool:
     return _bool_knob("WISPR_PASTE_INSTANT", "paste", "instant", False)
 
 
+def clipboard_restore() -> bool:
+    """Put the user's previous clipboard back after a paste. Default OFF
+    (2026-10-01): the restore raced slow-reading apps and made them paste
+    a stale dictation. [paste] restore_clipboard = true to opt back in."""
+    return _bool_knob("WISPR_RESTORE_CLIPBOARD", "paste",
+                      "restore_clipboard", False)
+
+
 def paste_revise() -> bool:
     """Whether instant mode is allowed to rewrite what it pasted once Haiku
     returns. OFF by default since 2026-08-04; set true to opt back in.

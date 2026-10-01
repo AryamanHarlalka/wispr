@@ -24,6 +24,7 @@ from . import (cleanup, cloud_stt, dictionary as dict_mod, history, learn as lea
 from .config import (WISPR_HOME, cleanup_wait_s, ensure_home, learn_from_edits,
                      learn_from_llm, load_corrections, load_modes,
                      load_snippets, load_vocab, paste_instant, paste_revise,
+                     clipboard_restore,
                      hotkey, revise_max_chars, revise_window_s, stt_backend,
                      stt_beam_size, stt_model)
 from .indicator import Indicator
@@ -241,11 +242,33 @@ _clip = {
 }
 # Let the target app consume the paste before putting the old clipboard
 # back. Named so the tests can shrink it instead of sleeping for real.
-RESTORE_DELAY_S = 0.6
+# 1.5 s, not 0.6: Electron apps (Claude Desktop) read the pasteboard
+# lazily when busy, and a restore that lands first makes Cmd-V paste the
+# OLD clipboard instead of the dictation.
+RESTORE_DELAY_S = 1.5
 # How long a restore waits for a revision/recovery to clear before giving
 # up. Giving up leaves the dictation on the clipboard, which is the safe
 # direction.
 RESTORE_GIVE_UP_S = 12.0
+
+
+def _recent_dictations() -> set[str]:
+    """Texts Wispr pasted recently, read from history so the guard
+    survives a daemon restart (the in-memory stamp does not)."""
+    try:
+        import json
+        tail = (WISPR_HOME / "history.jsonl").read_bytes()[-400_000:]
+        out = set()
+        for line in tail.decode("utf-8", "ignore").splitlines()[1:]:
+            try:
+                c = json.loads(line).get("cleaned")
+            except Exception:
+                continue
+            if c:
+                out.add(c.strip())
+        return out
+    except Exception:
+        return set()
 
 
 def _claim_clipboard(text: str) -> int:
@@ -261,6 +284,10 @@ def _claim_clipboard(text: str) -> int:
         current = _pasteboard_read()
         if _clip["text"] is not None and current == _clip["text"]:
             prior = _clip["prior"]
+        elif current and current.strip() in _recent_dictations():
+            # One of our own earlier dictations is not "the user's
+            # clipboard" -- never restore it over a newer paste.
+            prior = None
         else:
             prior = current
         _clip["gen"] += 1
@@ -315,7 +342,20 @@ def _stage_clipboard(text: str) -> int:
 
 def _schedule_restore(gen: int) -> None:
     """Put the user's own clipboard back, but only if that can be done
-    without overwriting something they still need."""
+    without overwriting something they still need.
+
+    OFF by default since 2026-10-01 ([paste] restore_clipboard = true to
+    re-enable). The "old dictation keeps pasting into chats" bug: a
+    dictation left on the clipboard (restore skipped, or the daemon
+    restarted mid-chain so the in-memory stamp was lost) was then treated
+    as the user's own clipboard. Every later paste restored it 0.6 s
+    afterwards, and whenever the target app read the pasteboard late,
+    Cmd-V pasted that stale dictation instead of the new one. Leaving the
+    newest dictation on the clipboard has no race at all, and Cmd-V
+    re-pastes what you just said.
+    """
+    if not clipboard_restore():
+        return
     with _clip_lock:
         if _clip["gen"] != gen or _clip["prior"] is None:
             return  # nothing to restore (empty or non-text clipboard)

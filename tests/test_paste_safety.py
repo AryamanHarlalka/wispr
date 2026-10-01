@@ -62,6 +62,9 @@ d._activate_target = lambda app=None: None
 d._frontmost_pid = lambda: 4242  # same app still frontmost by default
 # Real timings would make this suite take half a minute of sleeping.
 d.RESTORE_DELAY_S = 0.05
+# These suites test the restore machinery itself, so switch it on.
+d.clipboard_restore = lambda: True
+d._recent_dictations = lambda: set()
 d.RESTORE_GIVE_UP_S = 0.4
 SETTLE = d.RESTORE_DELAY_S + d.RESTORE_GIVE_UP_S + 0.35
 
