@@ -136,7 +136,16 @@ def handlers(dm):
         dm.run()
     except SystemExit:
         pass
-    return _Listener.captured["press"], _Listener.captured["release"]
+    p, r = _Listener.captured["press"], _Listener.captured["release"]
+
+    # Handlers now only stamp the time and queue the event; a worker does
+    # the work. Give it a beat before asserting on state.
+    def press(k):
+        p(k); time.sleep(0.03)
+
+    def release(k):
+        r(k); time.sleep(0.03)
+    return press, release
 
 
 HELD = d.TAP_MAX_S + 0.15      # unambiguously a hold
@@ -192,6 +201,26 @@ check("not committed instantly", dm.stopped == 0)
 time.sleep(SETTLE)
 check("committed once the window passed", dm.stopped == 1)
 check("did not enter hands-free", dm.hands_free is False)
+
+print("\n6. a slow mic start cannot turn a tap into a hold (2026-10-02)")
+# Opening the mic can take ~0.5 s. The whole double-tap lands while
+# _start() is still running; the key-ups queue behind it. Hold time must
+# come from when the keys really moved, not when the worker got to them.
+dm = make_daemon()
+_raw_start = dm._start
+def slow_start():
+    time.sleep(0.5)
+    _raw_start()
+dm._start = slow_start
+handlers(dm)
+p, r = _Listener.captured["press"], _Listener.captured["release"]
+p(_Key.alt_r); time.sleep(0.08); r(_Key.alt_r)
+time.sleep(0.12)
+p(_Key.alt_r); time.sleep(0.08); r(_Key.alt_r)
+time.sleep(0.5 + SETTLE)
+check("hands-free engaged despite the slow start", dm.hands_free is True)
+check("first tap was NOT transcribed as push-to-talk", dm.stopped == 0)
+check("still recording", dm.recording is True)
 
 print("\n5. other keys are ignored")
 dm = make_daemon()

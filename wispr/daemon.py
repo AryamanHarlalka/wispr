@@ -1362,9 +1362,18 @@ class Daemon:
 
     # --- hotkey ---
 
-    def _hotkey_down(self) -> None:
-        """Hotkey went down. Key-agnostic: both backends call this."""
-        self._press_t = time.time()
+    def _hotkey_down(self, t: float | None = None) -> None:
+        """Hotkey went down. Key-agnostic: both backends call this.
+
+        `t` is when the key ACTUALLY went down, stamped on the event
+        thread. 2026-10-02 double-tap fix: this used to read the clock
+        here, on the worker, after the queue hop. _start() (opening the
+        mic, reloading config) can take 300-500 ms, and the key-up queued
+        behind it was then measured as a 0.4 s+ "hold" -- so the first tap
+        of every double-tap was read as push-to-talk and stopped and
+        transcribed at once. Real event times make the gesture exact.
+        """
+        self._press_t = time.time() if t is None else t
 
         # While hands-free, the key is a stop button. The release handler
         # does the work, so holding it down cannot fire twice.
@@ -1381,9 +1390,11 @@ class Daemon:
         elif resumed:
             self.indicator.set("listening", "")
 
-    def _hotkey_up(self) -> None:
-        """Hotkey came up. Hold duration decides tap vs push-to-talk."""
-        now = time.time()
+    def _hotkey_up(self, t: float | None = None) -> None:
+        """Hotkey came up. Hold duration decides tap vs push-to-talk.
+        `t` is the real key-up time from the event thread (see
+        _hotkey_down)."""
+        now = time.time() if t is None else t
         held = now - self._press_t
 
         # Hands-free: any tap ends the session and commits the text.
@@ -1415,7 +1426,9 @@ class Daemon:
         # First tap. Hold the stop briefly in case a second one lands;
         # if it does not, this behaves exactly like a short press.
         self._last_tap = now
-        self._defer_stop(DOUBLE_TAP_S)
+        # The window runs from the real key-up, not from when the worker
+        # got here; a second tap already queued behind us still lands.
+        self._defer_stop(max(0.05, DOUBLE_TAP_S - (time.time() - now)))
 
     def _abandon_in_flight(self) -> None:
         """Drop any recording in progress so a rebuilt listener starts clean."""
@@ -1456,16 +1469,16 @@ class Daemon:
         # executed here instead, off the event-delivery thread. Unbounded on
         # purpose: dropping a key-up would strand the daemon mid-recording,
         # which is worse than a momentarily long queue.
-        events: "queue.Queue[bool]" = queue.Queue()
+        events: "queue.Queue[tuple[bool, float]]" = queue.Queue()
 
         def worker() -> None:
             while True:
-                is_down = events.get()
+                is_down, t = events.get()
                 try:
                     if is_down:
-                        self._hotkey_down()
+                        self._hotkey_down(t)
                     else:
-                        self._hotkey_up()
+                        self._hotkey_up(t)
                 except Exception as e:
                     print(f"[wispr] Fn worker error: "
                           f"{e.__class__.__name__}: {e}", flush=True)
@@ -1502,7 +1515,7 @@ class Daemon:
                                 self._front_at_press_t = time.time()
                             except Exception:
                                 self._front_at_press = None
-                        events.put(is_down)
+                        events.put((is_down, time.time()))
                 except Exception as e:
                     # Same contract as the pynput guards: never let an
                     # exception escape into the tap callback.
@@ -1551,19 +1564,43 @@ class Daemon:
             self._run_fn()
             return
         from pynput import keyboard
+        import queue
+
+        # Same contract as the Fn backend: stamp the time in the callback,
+        # do the work on a worker, so a slow _start() can never stretch a
+        # tap into a "hold".
+        events: "queue.Queue[tuple[bool, float]]" = queue.Queue()
+
+        def worker() -> None:
+            while True:
+                is_down, t = events.get()
+                try:
+                    if is_down:
+                        self._hotkey_down(t)
+                    else:
+                        self._hotkey_up(t)
+                except Exception as e:
+                    print(f"[wispr] hotkey worker error: "
+                          f"{e.__class__.__name__}: {e}", flush=True)
+
+        threading.Thread(target=worker, daemon=True,
+                         name="wispr-key-worker").start()
+        held_down = [False]
 
         def on_press(key):  # noqa: ANN001
-            if key == keyboard.Key.alt_r:
+            if key == keyboard.Key.alt_r and not held_down[0]:
+                held_down[0] = True  # ignore key-repeat while held
                 try:
                     self._front_at_press = modes_mod.frontmost_app()
                     self._front_at_press_t = time.time()
                 except Exception:
                     self._front_at_press = None
-                self._hotkey_down()
+                events.put((True, time.time()))
 
         def on_release(key):  # noqa: ANN001
             if key == keyboard.Key.alt_r:
-                self._hotkey_up()
+                held_down[0] = False
+                events.put((False, time.time()))
 
         def _guard(fn, name):
             """Last line of defence around every pynput callback.
