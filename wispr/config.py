@@ -339,6 +339,8 @@ def hotkey() -> str:
     v = env or load_config().get("hotkey", {}).get("key")
     if isinstance(v, str) and v.strip().lower() in ("fn", "globe"):
         return "fn"
+    if isinstance(v, str) and v.strip().lower() in ("ctrl", "control", "right_ctrl", "right_control", "ctrl_r"):
+        return "right_ctrl"   # 2026-10-12, Mac mini: hold Right Control (Ary)
     return "right_option"
 
 

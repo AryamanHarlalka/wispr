@@ -46,7 +46,10 @@ APP="$HOME/Applications/$APP_NAME.app"
 PY_APP_BIN="$("$PY" - <<'PYEOF'
 import os, sys
 p = os.path.join(sys.base_prefix, "Resources", "Python.app", "Contents", "MacOS", "Python")
-print(p if os.path.exists(p) else "")
+# 2026-10-12: Apple Silicon Mac mini has no python.org framework; a standalone
+# (python-build-standalone) interpreter is statically linked and not hardened, so
+# its own binary can be copied into the bundle just the same.
+print(p if os.path.exists(p) else os.path.realpath(sys.executable))
 PYEOF
 )"
 

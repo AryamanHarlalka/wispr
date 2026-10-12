@@ -1586,9 +1586,10 @@ class Daemon:
         threading.Thread(target=worker, daemon=True,
                          name="wispr-key-worker").start()
         held_down = [False]
+        HOT = keyboard.Key.ctrl_r if hotkey() == "right_ctrl" else keyboard.Key.alt_r
 
         def on_press(key):  # noqa: ANN001
-            if key == keyboard.Key.alt_r and not held_down[0]:
+            if key == HOT and not held_down[0]:
                 held_down[0] = True  # ignore key-repeat while held
                 try:
                     self._front_at_press = modes_mod.frontmost_app()
@@ -1598,7 +1599,7 @@ class Daemon:
                 events.put((True, time.time()))
 
         def on_release(key):  # noqa: ANN001
-            if key == keyboard.Key.alt_r:
+            if key == HOT:
                 held_down[0] = False
                 events.put((False, time.time()))
 
