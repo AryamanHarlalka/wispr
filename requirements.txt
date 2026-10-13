@@ -5,3 +5,6 @@ numpy>=1.26
 anthropic>=0.40
 pyobjc-framework-Cocoa>=10.0
 tomli>=2; python_version < "3.11"
+# optional: hands-free wake word (wispr/wake.py, off by default)
+sherpa-onnx>=1.12
+sentencepiece>=0.2

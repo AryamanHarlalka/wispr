@@ -464,10 +464,18 @@ def coop_key_enabled() -> bool:
     return os.environ.get("WISPR_COOP_KEY", "1").strip() not in ("0", "false", "off")
 
 
-def _coop_note(kind: str, text: str = "") -> bool:
+def _coop_note(kind: str, text: str = "", source: str = "") -> bool:
     """Tell the Coop overlay (com.aryaman.coop.overlay) what the Coop key is
     doing: listen / hear(text) / cancel. Returns False if the overlay is not
-    running, so the pill can say so instead of the words vanishing."""
+    running, so the pill can say so instead of the words vanishing.
+    `source` ("wake") marks notes from the hands-free listener (wake.py)."""
+    if kind == "hear" and not source:
+        try:
+            from . import wake
+            if wake.intercept_hear(text):   # "<name>, stop listening"
+                return True
+        except Exception as e:
+            print(f"[wispr] wake intercept failed: {e}", flush=True)
     try:
         from AppKit import NSRunningApplication
         from Foundation import NSDistributedNotificationCenter
@@ -477,7 +485,8 @@ def _coop_note(kind: str, text: str = "") -> bool:
         NSDistributedNotificationCenter.defaultCenter() \
             .postNotificationName_object_userInfo_deliverImmediately_(
                 f"com.aryaman.coop.overlay.{kind}", None,
-                {"text": text} if text else None, True)
+                ({"text": text} if text else {}) | ({"source": source} if source else {})
+                or None, True)
         return True
     except Exception as e:
         print(f"[wispr] coop note failed: {e.__class__.__name__}: {e}", flush=True)
@@ -1782,7 +1791,15 @@ def main() -> None:
     indicator = Indicator()
 
     def _run_daemon() -> None:
-        Daemon(indicator=indicator).run()
+        d = Daemon(indicator=indicator)
+        try:
+            # Hands-free "hey <name>" (wake.py): own thread + own mic stream,
+            # off unless [wake] enabled = true. Never allowed to stop dictation.
+            from . import wake
+            wake.start(d)
+        except Exception as e:
+            print(f"[wispr] wake listener not started: {e}", flush=True)
+        d.run()
 
     indicator.start_background(_run_daemon)
     indicator.run()

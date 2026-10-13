@@ -22,6 +22,7 @@ USAGE = """wispr — local voice dictation for macOS
   wispr last --no-copy      print it without touching the clipboard
   wispr menubar             run the optional menu-bar companion
   wispr bench               measure accuracy and latency
+  wispr wake-setup          fetch the local wake-word models ([wake] in config.toml)
 """
 
 
@@ -268,6 +269,9 @@ def main() -> None:
     elif cmd == "menubar":
         from .menubar import main as run_mb
         run_mb()
+    elif cmd == "wake-setup":
+        from .wake import setup_models
+        setup_models()
     elif cmd == "bench":
         from .bench import main as run_bench
         sys.argv = [sys.argv[0]] + args[1:]

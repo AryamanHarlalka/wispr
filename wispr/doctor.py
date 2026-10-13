@@ -579,12 +579,38 @@ def check_config() -> None:
               f"{e.__class__.__name__}: {str(e)[:80]}")
 
 
+def check_wake() -> None:
+    """Hands-free wake word (wake.py): off by default, models local."""
+    from . import wake
+    cfg = wake.load_wake_config()
+    if not cfg.enabled:
+        _emit("ok", "Wake word: off ([wake] enabled = false)")
+        return
+    have = (wake.MODEL_DIR / wake.KWS_NAME / "tokens.txt").exists() and \
+        (wake.MODEL_DIR / "silero_vad.onnx").exists()
+    try:
+        import sentencepiece  # noqa: F401
+        import sherpa_onnx  # noqa: F401
+        libs = True
+    except Exception:
+        libs = False
+    if not (have and libs):
+        _emit("warn", "Wake word on but not ready",
+              "models missing" if not have else "sherpa-onnx / sentencepiece not installed",
+              "pip install sherpa-onnx sentencepiece && wispr wake-setup")
+        return
+    paused = " · PAUSED (say the resume phrase or press the assistant key)" \
+        if wake.PAUSE_FILE.exists() else ""
+    _emit("ok", f"Wake word: {', '.join(cfg.phrases)} · sensitivity {cfg.sensitivity} · "
+                f"follow-up {cfg.followup_s:.0f}s · resume '{cfg.resume_phrase}'{paused}")
+
+
 def main() -> None:
     print(f"\n{BOLD}wispr doctor{RST}\n")
     for fn in (check_duplicates, check_listener_alive, check_accessibility,
                check_mic_contention, check_mic_entitlement,
                check_microphone, check_model,
-               check_globe_key, check_key, check_config):
+               check_globe_key, check_key, check_config, check_wake):
         try:
             fn()
         except Exception as e:  # a broken check must not hide the others
