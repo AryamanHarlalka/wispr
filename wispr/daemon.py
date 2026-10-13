@@ -458,6 +458,31 @@ def _activate_target(target_app) -> bool:  # noqa: ANN001
         return False
 
 
+def coop_key_enabled() -> bool:
+    """The second Control key talks to Coop. WISPR_COOP_KEY=0 turns it off."""
+    return os.environ.get("WISPR_COOP_KEY", "1").strip() not in ("0", "false", "off")
+
+
+def _coop_note(kind: str, text: str = "") -> bool:
+    """Tell the Coop overlay (com.aryaman.coop.overlay) what the Coop key is
+    doing: listen / hear(text) / cancel. Returns False if the overlay is not
+    running, so the pill can say so instead of the words vanishing."""
+    try:
+        from AppKit import NSRunningApplication
+        from Foundation import NSDistributedNotificationCenter
+        if not NSRunningApplication.runningApplicationsWithBundleIdentifier_(
+                "com.aryaman.coop.overlay"):
+            return False
+        NSDistributedNotificationCenter.defaultCenter() \
+            .postNotificationName_object_userInfo_deliverImmediately_(
+                f"com.aryaman.coop.overlay.{kind}", None,
+                {"text": text} if text else None, True)
+        return True
+    except Exception as e:
+        print(f"[wispr] coop note failed: {e.__class__.__name__}: {e}", flush=True)
+        return False
+
+
 def paste_text(text: str, target_app=None) -> None:
     """Copy -> reactivate the original target app -> Cmd-V -> restore the
     prior clipboard (table stakes, spec §1).
@@ -880,8 +905,13 @@ class Daemon:
         self.snippets = load_snippets()
         self.corrections = load_corrections()
         self.dictionary = dict_mod.load_dictionary()
+        self._take_to_coop = bool(getattr(self, "_to_coop", False))
+        self.indicator.set_coop(self._take_to_coop)
+        if self._take_to_coop:
+            _coop_note("listen")
         self.indicator.set("listening",
-                           "hands-free" if self.hands_free else "")
+                           "Coop" if self._take_to_coop else
+                           ("hands-free" if self.hands_free else ""))
         # Open the TLS connection while the user is still speaking so the
         # Haiku call after key-release starts on a warm connection (B1).
         cleanup.prewarm_connection()
@@ -938,6 +968,8 @@ class Daemon:
             print("[wispr] take dropped: only %.2fs of audio (a stray tap, "
                   "not speech)" % (audio.size / SAMPLE_RATE), flush=True)
             self.indicator.hide()
+            if getattr(self, "_take_to_coop", False):
+                _coop_note("cancel")
             return
         target_app = self._target_app
         threading.Thread(target=self._process,
@@ -985,6 +1017,7 @@ class Daemon:
     def _process(self, audio: np.ndarray, target_app=None,
                  incremental: "IncrementalTranscriber | None" = None) -> None:
         t0 = time.time()
+        to_coop = bool(getattr(self, "_take_to_coop", False))
         bundle = modes_mod.bundle_id_of(target_app)
         mode = modes_mod.mode_for(bundle, self.modes)
         try:
@@ -1097,6 +1130,15 @@ class Daemon:
             # Hold every clipboard restore until we know whether a
             # revision is going to run. A restore firing mid-revision is
             # half of what turned a failed revision into lost text.
+            if to_coop:
+                ok = _coop_note("hear", cleaned) if cleaned.strip() else False
+                if not ok:
+                    _coop_note("cancel")
+                ms = int((time.time() - t0) * 1000)
+                self.indicator.set("coop" if ok else "error",
+                                   f"{len(cleaned.split())}w" if ok else "Coop isn't running")
+                self._record_update(rec_id, path="coop", latency_ms=ms)
+                return
             _begin_revision_window()
             try:
                 try:
@@ -1449,6 +1491,8 @@ class Daemon:
         if self.recording:
             self._abandon_in_flight()
             self.indicator.hide()
+            if getattr(self, "_take_to_coop", False):
+                _coop_note("cancel")
 
     def _abandon_in_flight(self) -> None:
         """Drop any recording in progress so a rebuilt listener starts clean."""
@@ -1493,6 +1537,11 @@ class Daemon:
         RIGHT_CTRL = HK in ("right_ctrl", "left_ctrl")   # = a Control key
         CTRL_KEYCODE = {"left_ctrl": 59, "right_ctrl": 62}.get(HK)
         CTRL_FLAG = Quartz.kCGEventFlagMaskControl
+        # 2026-10-13 (Ary): the OTHER Control key talks to Coop instead of
+        # typing — same mic, same transcription, a grey "Coop" pill, and the
+        # words go to Coop (the overlay answers out loud) rather than pasting.
+        COOP_KEYCODE = {59: 62, 62: 59}.get(CTRL_KEYCODE) if coop_key_enabled() else None
+        active = [CTRL_KEYCODE]
         HOT_MASK = FN
         KEY_NAME = {"left_ctrl": "Left Control",
                     "right_ctrl": "Right Control"}.get(HK, "Fn")
@@ -1550,9 +1599,14 @@ class Daemon:
                     if CTRL_KEYCODE is not None:
                         kc = Quartz.CGEventGetIntegerValueField(
                             event, Quartz.kCGKeyboardEventKeycode)
-                        if kc != CTRL_KEYCODE:
+                        if kc not in (CTRL_KEYCODE, COOP_KEYCODE):
                             return event  # another modifier; state unchanged
+                        if down[0] and kc != active[0]:
+                            return event  # the other Control key mid-take: ignore
                         is_down = bool(Quartz.CGEventGetFlags(event) & CTRL_FLAG)
+                        if is_down and not down[0]:
+                            active[0] = kc
+                            self._to_coop = kc == COOP_KEYCODE
                     else:
                         is_down = bool(Quartz.CGEventGetFlags(event) & HOT_MASK)
                     if is_down != down[0]:

@@ -58,7 +58,11 @@ COLORS = {
     "cleaning": ((0x5a, 0xc8, 0xfa), "cleaning"),
     "pasted": ((0x32, 0xd7, 0x4b), "pasted"),
     "error": ((0xff, 0x5f, 0x57), "error"),
+    "coop": ((0xf5, 0xf3, 0xec), "sent to Coop"),
 }
+# Coop key (2026-10-13): same pill, a lighter grey body, so Ary can tell at a
+# glance he is talking to Coop rather than dictating.
+PILL_BG_COOP = (0x3a, 0x3b, 0x40)
 IDLE_COLOR = (0x88, 0x88, 0x88)
 
 # --- capsule + waveform geometry ---
@@ -170,6 +174,8 @@ class Indicator:
         self._text = ""
         self._color = IDLE_COLOR
         self._color_target = IDLE_COLOR
+        self._bg = PILL_BG
+        self._bg_target = PILL_BG
         self._visible = False
         self._alpha = 0.0
         self._alpha_target = 0.0
@@ -188,6 +194,10 @@ class Indicator:
         write_state(state, detail)
         if not self._headless:
             self._q.put((state, detail))
+
+    def set_coop(self, on: bool) -> None:
+        """Tint the next takes for Coop (lighter grey) or dictation (black)."""
+        self._bg_target = PILL_BG_COOP if on else PILL_BG
 
     def hide(self) -> None:
         write_state("idle")
@@ -373,7 +383,7 @@ class Indicator:
         r = PILL_H / 2.0
         body = NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
             self._NSMakeRect(0.5, 1.0, w - 1.0, PILL_H), r, r)
-        self._rgb(PILL_BG).setFill()
+        self._rgb(self._bg).setFill()
         body.fill()
 
         show_wave = self._show_wave()
@@ -383,7 +393,7 @@ class Indicator:
                 color = self._color
                 heights = self._disp
             else:
-                color = _lerp_rgb(PILL_BG, self._color, 0.75)
+                color = _lerp_rgb(self._bg, self._color, 0.75)
                 t = (time.time() - self._t0) * SHIMMER_SPEED
                 heights = [SHIMMER_AMP * (0.5 + 0.5 * math.sin(t - i * 0.55))
                            for i in range(BAR_COUNT)]
@@ -397,7 +407,7 @@ class Indicator:
                 x += BAR_PERIOD
             x += TEXT_GAP - BAR_PERIOD
         if self._text:
-            fg = self._color if self._state in ("pasted", "error") else TEXT_FG
+            fg = self._color if self._state in ("pasted", "error", "coop") else TEXT_FG
             attrs = {NSFontAttributeName: self._font,
                      NSForegroundColorAttributeName: self._rgb(fg)}
             s = NSAttributedString.alloc().initWithString_attributes_(
@@ -421,6 +431,8 @@ class Indicator:
                 color, text = COLORS.get(state, (IDLE_COLOR, state))
                 if state == "listening" and not detail:
                     text = ""  # recording is waveform-only
+                elif state == "listening" and detail == "Coop":
+                    text = "Coop"  # the Coop key: waveform + its name
                 elif detail:
                     text = f"{text} · {detail}"
                 self._text = text
@@ -434,7 +446,7 @@ class Indicator:
                     self._color = color  # first show: no cross-fade from grey
                 self._visible = True
                 self._alpha_target = PILL_ALPHA
-                self._hide_at = now + PASTED_HOLD_S if state == "pasted" else 0.0
+                self._hide_at = now + PASTED_HOLD_S if state in ("pasted", "coop") else 0.0
         except queue.Empty:
             pass
 
@@ -462,6 +474,8 @@ class Indicator:
                 self._disp[i] += (tgt - self._disp[i]) * k
 
         self._color = _lerp_rgb(self._color, self._color_target, COLOR_EASE)
+        self._bg = (self._bg_target if not self._visible or self._alpha < 0.05
+                    else _lerp_rgb(self._bg, self._bg_target, COLOR_EASE))
         tw = self._pill_w()
         if abs(tw - self._disp_w) < 0.75:
             self._disp_w = tw
