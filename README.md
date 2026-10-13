@@ -134,7 +134,7 @@ key = "fn"
 Then set System Settings → Keyboard → *Press globe key to* → **Do Nothing**,
 or the emoji picker opens on every dictation (`wispr doctor` checks this).
 
-### Right Control as the hotkey
+### Control as the hotkey
 
 ```toml
 # ~/.wispr/config.toml
@@ -142,9 +142,9 @@ or the emoji picker opens on every dictation (`wispr doctor` checks this).
 key = "ctrl"
 ```
 
-Hold Right Control to dictate; double-tap for hands-free. Left Control is
-untouched, and Control shortcuts still work: press any other key (or click)
-while Right Control is held and that press is treated as a shortcut — the
+Hold Left Control to dictate (`"right_ctrl"` for the right one); double-tap for
+hands-free. Control shortcuts still work: press any other key (or click)
+while it is held and that press is treated as a shortcut — the
 recording is dropped, nothing pastes.
 
 ### An org-level Anthropic key
