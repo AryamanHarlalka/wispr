@@ -339,14 +339,17 @@ def hotkey() -> str:
     v = env or load_config().get("hotkey", {}).get("key")
     if isinstance(v, str) and v.strip().lower() in ("fn", "globe"):
         return "fn"
-    if isinstance(v, str) and v.strip().lower() in ("ctrl", "control", "right_ctrl", "right_control", "ctrl_r"):
-        return "right_ctrl"   # 2026-10-12, Mac mini: hold Right Control (Ary)
+    if isinstance(v, str) and v.strip().lower() in ("ctrl", "control", "left_ctrl", "left_control", "ctrl_l"):
+        return "left_ctrl"    # 2026-10-13, Mac mini: hold Left Control (Ary)
+    if isinstance(v, str) and v.strip().lower() in ("right_ctrl", "right_control", "ctrl_r"):
+        return "right_ctrl"
     return "right_option"
 
 
 def hotkey_label() -> str:
     """Human name of the configured hotkey, for messages."""
-    return {"fn": "Fn", "right_ctrl": "Right Control"}.get(hotkey(),
+    return {"fn": "Fn", "right_ctrl": "Right Control",
+            "left_ctrl": "Left Control"}.get(hotkey(),
                                                            "Right Option")
 
 

@@ -1486,10 +1486,16 @@ class Daemon:
         # it gets the same supervision and real event timestamps. The
         # device-dependent bit tells right from left Control; any key or
         # click while it is held makes it a shortcut, which cancels.
-        RIGHT_CTRL = hotkey() == "right_ctrl"
-        NX_DEVICERCTLKEYMASK = 0x00002000
-        HOT_MASK = NX_DEVICERCTLKEYMASK if RIGHT_CTRL else FN
-        KEY_NAME = "Right Control" if RIGHT_CTRL else "Fn"
+        # Control is matched by the key's own keycode (59 left, 62 right) on
+        # flagsChanged, not the device-dependent flag bits: some Bluetooth
+        # keyboards never set those, which left Right Control dead (10-13).
+        HK = hotkey()
+        RIGHT_CTRL = HK in ("right_ctrl", "left_ctrl")   # = a Control key
+        CTRL_KEYCODE = {"left_ctrl": 59, "right_ctrl": 62}.get(HK)
+        CTRL_FLAG = Quartz.kCGEventFlagMaskControl
+        HOT_MASK = FN
+        KEY_NAME = {"left_ctrl": "Left Control",
+                    "right_ctrl": "Right Control"}.get(HK, "Fn")
         COMBO_TYPES = (Quartz.kCGEventKeyDown, Quartz.kCGEventLeftMouseDown,
                        Quartz.kCGEventRightMouseDown,
                        Quartz.kCGEventOtherMouseDown)
@@ -1541,7 +1547,14 @@ class Daemon:
                             combo[0] = True
                             events.put(("combo", time.time()))
                         return event
-                    is_down = bool(Quartz.CGEventGetFlags(event) & HOT_MASK)
+                    if CTRL_KEYCODE is not None:
+                        kc = Quartz.CGEventGetIntegerValueField(
+                            event, Quartz.kCGKeyboardEventKeycode)
+                        if kc != CTRL_KEYCODE:
+                            return event  # another modifier; state unchanged
+                        is_down = bool(Quartz.CGEventGetFlags(event) & CTRL_FLAG)
+                    else:
+                        is_down = bool(Quartz.CGEventGetFlags(event) & HOT_MASK)
                     if is_down != down[0]:
                         down[0] = is_down
                         if is_down:
@@ -1603,7 +1616,7 @@ class Daemon:
             time.sleep(2.0)
 
     def run(self) -> None:
-        if hotkey() in ("fn", "right_ctrl"):
+        if hotkey() in ("fn", "right_ctrl", "left_ctrl"):
             self._run_fn()
             return
         from pynput import keyboard

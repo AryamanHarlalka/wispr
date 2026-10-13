@@ -91,11 +91,11 @@ t3 = t(); dm._hotkey_down(t3); dm._hotkey_up(t3 + TAP)
 check("hands-free cleared", dm.hands_free is False)
 check("committed once", dm.stopped == 1)
 
-print("\n7. config: 'ctrl' maps to Right Control")
+print("\n7. config: 'ctrl' maps to Left Control")
 os.environ["WISPR_HOTKEY"] = "ctrl"
 from wispr.config import hotkey, hotkey_label
-check("hotkey() == right_ctrl", hotkey() == "right_ctrl")
-check("label says Right Control", hotkey_label() == "Right Control")
+check("hotkey() == left_ctrl", hotkey() == "left_ctrl")
+check("label says Left Control", hotkey_label() == "Left Control")
 
 print()
 if FAILS:
