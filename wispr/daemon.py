@@ -459,7 +459,8 @@ def _activate_target(target_app) -> bool:  # noqa: ANN001
 
 
 def coop_key_enabled() -> bool:
-    """Fn talks to Coop (Control keeps dictating). WISPR_COOP_KEY=0 turns it off."""
+    """Right Option (or Fn on Apple keyboards) talks to Coop; Control keeps
+    dictating. WISPR_COOP_KEY=0 turns it off."""
     return os.environ.get("WISPR_COOP_KEY", "1").strip() not in ("0", "false", "off")
 
 
@@ -1543,6 +1544,13 @@ class Daemon:
         # tried first and never fired on his keyboard. Needs System Settings →
         # Keyboard → "Press 🌐 key to" = Do Nothing (it is, 10-13).
         FN_KEYCODE = 63
+        # The Mini's keyboard is a Logitech Pebble K380s: its Fn key never
+        # reaches macOS (the keyboard keeps it) and it has no Right Control,
+        # so Right Option is the Coop key there. Fn still works on Apple
+        # keyboards. Option+key shortcuts cancel the take like Ctrl combos.
+        ROPT_KEYCODE = 61
+        seen_mods: set = set()
+        OPT_FLAG = Quartz.kCGEventFlagMaskAlternate
         COOP_FN = coop_key_enabled() and CTRL_KEYCODE is not None
         active = [CTRL_KEYCODE]
         HOT_MASK = FN
@@ -1604,18 +1612,23 @@ class Daemon:
                             event, Quartz.kCGKeyboardEventKeycode)
                         flags = Quartz.CGEventGetFlags(event)
                         if COOP_FN and kc == FN_KEYCODE:
-                            is_down = bool(flags & FN)       # Fn / globe = Coop
+                            is_down = bool(flags & FN)       # Fn / globe = Coop (Apple keyboards)
+                        elif COOP_FN and kc == ROPT_KEYCODE:
+                            is_down = bool(flags & OPT_FLAG)  # Right Option = Coop (the Pebble)
                         elif kc == CTRL_KEYCODE:
                             is_down = bool(flags & CTRL_FLAG)
                         else:
+                            if kc not in seen_mods:       # which modifiers this keyboard sends (no letters)
+                                seen_mods.add(kc)
+                                print(f"[wispr] modifier keycode seen: {kc}", flush=True)
                             return event  # another modifier; state unchanged
                         if down[0] and kc != active[0]:
                             return event  # the other key mid-take: ignore
                         if is_down and not down[0]:
                             active[0] = kc
-                            self._to_coop = kc == FN_KEYCODE
+                            self._to_coop = kc in (FN_KEYCODE, ROPT_KEYCODE)
                             if self._to_coop:
-                                print("[wispr] Coop key (Fn) down", flush=True)
+                                print(f"[wispr] Coop key down ({'Fn' if kc == FN_KEYCODE else 'Right Option'})", flush=True)
                     else:
                         is_down = bool(Quartz.CGEventGetFlags(event) & HOT_MASK)
                     if is_down != down[0]:
