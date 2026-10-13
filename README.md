@@ -134,6 +134,31 @@ key = "fn"
 Then set System Settings → Keyboard → *Press globe key to* → **Do Nothing**,
 or the emoji picker opens on every dictation (`wispr doctor` checks this).
 
+### Right Control as the hotkey
+
+```toml
+# ~/.wispr/config.toml
+[hotkey]
+key = "ctrl"
+```
+
+Hold Right Control to dictate; double-tap for hands-free. Left Control is
+untouched, and Control shortcuts still work: press any other key (or click)
+while Right Control is held and that press is treated as a shortcut — the
+recording is dropped, nothing pastes.
+
+### An org-level Anthropic key
+
+A key that is not scoped to a workspace (`sk-ant-usr…`) needs the
+workspace ID alongside it. Store it once:
+
+```sh
+security add-generic-password -U -a wispr -s wispr-anthropic-workspace -w <wrkspc_…>
+```
+
+(or set `ANTHROPIC_WORKSPACE_ID`, or `[llm] workspace_id` in config.toml).
+A workspace-scoped key needs nothing extra.
+
 ### Latency vs. polish
 
 By default the cleanup pass runs *before* the paste, under a hard 2-second

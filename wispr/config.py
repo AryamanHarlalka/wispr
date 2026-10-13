@@ -344,6 +344,12 @@ def hotkey() -> str:
     return "right_option"
 
 
+def hotkey_label() -> str:
+    """Human name of the configured hotkey, for messages."""
+    return {"fn": "Fn", "right_ctrl": "Right Control"}.get(hotkey(),
+                                                           "Right Option")
+
+
 def paste_instant() -> bool:
     """Instant-paste mode (2026-07-30). OFF by default since 2026-09-06.
 
@@ -471,6 +477,37 @@ def anthropic_key() -> str | None:
     except Exception:
         pass
     return None
+
+
+WORKSPACE_KEYCHAIN_SERVICE = "wispr-anthropic-workspace"
+
+
+def anthropic_workspace() -> str | None:
+    """Workspace ID for an org-level (sk-ant-usr...) key that is not scoped
+    to a workspace -- the API refuses those without an
+    anthropic-workspace-id header. Env, then keychain item
+    'wispr-anthropic-workspace', then [llm] workspace_id in config.toml.
+    A workspace-scoped key needs none of this."""
+    ws = os.environ.get("ANTHROPIC_WORKSPACE_ID", "").strip()
+    if ws:
+        return ws
+    try:
+        r = subprocess.run(
+            ["security", "find-generic-password", "-s",
+             WORKSPACE_KEYCHAIN_SERVICE, "-w"],
+            capture_output=True, text=True, timeout=3,
+        )
+        if r.returncode == 0 and r.stdout.strip():
+            return r.stdout.strip()
+    except Exception:
+        pass
+    v = load_config().get("llm", {}).get("workspace_id")
+    return v.strip() if isinstance(v, str) and v.strip() else None
+
+
+def anthropic_headers() -> dict | None:
+    ws = anthropic_workspace()
+    return {"anthropic-workspace-id": ws} if ws else None
 
 
 def set_anthropic_key(key: str) -> None:

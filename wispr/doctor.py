@@ -529,7 +529,9 @@ def check_key() -> None:
         return
     try:
         import anthropic
-        client = anthropic.Anthropic(api_key=key)
+        from .config import anthropic_headers
+        client = anthropic.Anthropic(api_key=key,
+                                     default_headers=anthropic_headers())
         client.messages.create(model="claude-haiku-4-5", max_tokens=4,
                                messages=[{"role": "user", "content": "hi"}])
         _emit("ok", "Anthropic key works (Haiku cleanup active)")
@@ -598,7 +600,8 @@ def main() -> None:
     if warns:
         print(f"  {YLW}Working, with {warns} optional improvement(s).{RST}\n")
     else:
-        _key = "Fn" if hotkey() == "fn" else "Right Option"
+        from .config import hotkey_label
+        _key = hotkey_label()
         print(f"  {GRN}{BOLD}All good.{RST} Hold {_key} and speak.\n")
 
 

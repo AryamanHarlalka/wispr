@@ -60,7 +60,13 @@ def _get_client():
                 return None
             try:
                 import anthropic
-                import httpx
+                # anthropic>=1.x is built on httpx2; older releases on httpx.
+                # Use whichever the installed SDK uses, or its Limits type
+                # won't match (this silently turned cleanup off on the Mini).
+                try:
+                    import httpx2 as httpx
+                except ImportError:
+                    import httpx
                 # Long keepalive so a connection warmed at record-start is
                 # still alive when a 30 s dictation finally hits Haiku
                 # (httpx's default keepalive_expiry is 5 s).
@@ -69,8 +75,10 @@ def _get_client():
                                         max_connections=4,
                                         keepalive_expiry=600.0),
                 )
+                from .config import anthropic_headers
                 _client = anthropic.Anthropic(api_key=key,
-                                              http_client=http_client)
+                                              http_client=http_client,
+                                              default_headers=anthropic_headers())
             except Exception:
                 return None
     return _client

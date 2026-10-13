@@ -88,7 +88,10 @@ def _get_client():
     if _client is None:
         with _lock:
             if _client is None:
-                import httpx
+                try:
+                    import httpx
+                except ImportError:  # anthropic>=1.x ships httpx2 only
+                    import httpx2 as httpx
                 _client = httpx.Client(
                     timeout=httpx.Timeout(20.0, connect=4.0),
                     limits=httpx.Limits(max_keepalive_connections=2,

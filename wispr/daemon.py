@@ -820,7 +820,8 @@ class Daemon:
 
         print(f"[wispr] loading {BACKEND_NAME}/{MODEL_NAME} …", flush=True)
         self.model = stt.build_backend(BACKEND_NAME, MODEL_NAME)
-        _key_name = "Fn" if hotkey() == "fn" else "Right Option"
+        from .config import hotkey_label
+        _key_name = hotkey_label()
         print(f"[wispr] ready — hold {_key_name} to dictate "
               f"(vocab: {len(self.vocab)} terms, dictionary: "
               f"{len(self.dictionary)}, corrections: {len(self.corrections)}, "
@@ -1374,6 +1375,7 @@ class Daemon:
         transcribed at once. Real event times make the gesture exact.
         """
         self._press_t = time.time() if t is None else t
+        self._combo = False
 
         # While hands-free, the key is a stop button. The release handler
         # does the work, so holding it down cannot fire twice.
@@ -1396,6 +1398,9 @@ class Daemon:
         _hotkey_down)."""
         now = time.time() if t is None else t
         held = now - self._press_t
+        if getattr(self, "_combo", False):
+            self._combo = False
+            return  # a shortcut, already cancelled in _hotkey_combo
 
         # Hands-free: any tap ends the session and commits the text.
         if self.hands_free:
@@ -1430,6 +1435,21 @@ class Daemon:
         # got here; a second tap already queued behind us still lands.
         self._defer_stop(max(0.05, DOUBLE_TAP_S - (time.time() - now)))
 
+    def _hotkey_combo(self) -> None:
+        """The hotkey was used as a modifier (Right Control + C, a
+        Ctrl-click). That is a shortcut, not a dictation: throw away the
+        recording the press opened, without transcribing or pasting, and
+        make sure the coming key-up neither stops a hands-free session nor
+        counts as the first tap of a double-tap. (2026-10-13, Mac mini.)"""
+        self._combo = True
+        self._last_tap = 0.0
+        if self.hands_free:
+            return  # the session keeps running; only this press is ignored
+        self._cancel_pending_stop()
+        if self.recording:
+            self._abandon_in_flight()
+            self.indicator.hide()
+
     def _abandon_in_flight(self) -> None:
         """Drop any recording in progress so a rebuilt listener starts clean."""
         try:
@@ -1462,6 +1482,17 @@ class Daemon:
         import queue
 
         FN = Quartz.kCGEventFlagMaskSecondaryFn
+        # Right Control (2026-10-13, Mac mini) rides the same tap as Fn, so
+        # it gets the same supervision and real event timestamps. The
+        # device-dependent bit tells right from left Control; any key or
+        # click while it is held makes it a shortcut, which cancels.
+        RIGHT_CTRL = hotkey() == "right_ctrl"
+        NX_DEVICERCTLKEYMASK = 0x00002000
+        HOT_MASK = NX_DEVICERCTLKEYMASK if RIGHT_CTRL else FN
+        KEY_NAME = "Right Control" if RIGHT_CTRL else "Fn"
+        COMBO_TYPES = (Quartz.kCGEventKeyDown, Quartz.kCGEventLeftMouseDown,
+                       Quartz.kCGEventRightMouseDown,
+                       Quartz.kCGEventOtherMouseDown)
         DISABLED = (Quartz.kCGEventTapDisabledByTimeout,
                     Quartz.kCGEventTapDisabledByUserInput)
 
@@ -1469,18 +1500,20 @@ class Daemon:
         # executed here instead, off the event-delivery thread. Unbounded on
         # purpose: dropping a key-up would strand the daemon mid-recording,
         # which is worse than a momentarily long queue.
-        events: "queue.Queue[tuple[bool, float]]" = queue.Queue()
+        events: "queue.Queue[tuple[object, float]]" = queue.Queue()
 
         def worker() -> None:
             while True:
                 is_down, t = events.get()
                 try:
-                    if is_down:
+                    if is_down == "combo":
+                        self._hotkey_combo()
+                    elif is_down:
                         self._hotkey_down(t)
                     else:
                         self._hotkey_up(t)
                 except Exception as e:
-                    print(f"[wispr] Fn worker error: "
+                    print(f"[wispr] {KEY_NAME} worker error: "
                           f"{e.__class__.__name__}: {e}", flush=True)
 
         threading.Thread(target=worker, daemon=True,
@@ -1488,6 +1521,7 @@ class Daemon:
 
         while True:
             down = [False]
+            combo = [False]
             tap = None
 
             def cb(proxy, etype, event, refcon):  # noqa: ANN001
@@ -1498,13 +1532,20 @@ class Daemon:
                 # driving it. Read the flag, hand it to the worker, leave.
                 try:
                     if etype in DISABLED:
-                        print("[wispr] Fn tap disabled by macOS — re-enabling",
+                        print(f"[wispr] {KEY_NAME} tap disabled by macOS — re-enabling",
                               flush=True)
                         Quartz.CGEventTapEnable(tap, True)
                         return event
-                    is_down = bool(Quartz.CGEventGetFlags(event) & FN)
+                    if etype in COMBO_TYPES:
+                        if down[0] and not combo[0]:
+                            combo[0] = True
+                            events.put(("combo", time.time()))
+                        return event
+                    is_down = bool(Quartz.CGEventGetFlags(event) & HOT_MASK)
                     if is_down != down[0]:
                         down[0] = is_down
+                        if is_down:
+                            combo[0] = False
                         if is_down:
                             # Sample the front app HERE, on the event
                             # thread, before the worker hop and before
@@ -1519,7 +1560,7 @@ class Daemon:
                 except Exception as e:
                     # Same contract as the pynput guards: never let an
                     # exception escape into the tap callback.
-                    print(f"[wispr] Fn handler error: "
+                    print(f"[wispr] {KEY_NAME} handler error: "
                           f"{e.__class__.__name__}: {e}", flush=True)
                 return event
 
@@ -1527,14 +1568,16 @@ class Daemon:
                 Quartz.kCGSessionEventTap,
                 Quartz.kCGHeadInsertEventTap,
                 Quartz.kCGEventTapOptionListenOnly,
-                Quartz.CGEventMaskBit(Quartz.kCGEventFlagsChanged),
+                (Quartz.CGEventMaskBit(Quartz.kCGEventFlagsChanged)
+                 | (sum(Quartz.CGEventMaskBit(t) for t in COMBO_TYPES)
+                    if RIGHT_CTRL else 0)),
                 cb, None)
 
             if not tap:
-                print("[wispr] could not create the Fn event tap — grant "
+                print(f"[wispr] could not create the {KEY_NAME} event tap — grant "
                       "Accessibility to Wispr.app, retrying in 5 s",
                       flush=True)
-                self.indicator.set("error", "Fn hotkey needs Accessibility")
+                self.indicator.set("error", f"{KEY_NAME} hotkey needs Accessibility")
                 time.sleep(5.0)
                 continue
 
@@ -1542,7 +1585,7 @@ class Daemon:
             Quartz.CFRunLoopAddSource(Quartz.CFRunLoopGetCurrent(), src,
                                       Quartz.kCFRunLoopCommonModes)
             Quartz.CGEventTapEnable(tap, True)
-            print("[wispr] daemon running (Fn hotkey). Ctrl-C to quit.",
+            print(f"[wispr] daemon running ({KEY_NAME} hotkey). Ctrl-C to quit.",
                   flush=True)
 
             # Short slices so a tap macOS silently disabled gets noticed even
@@ -1556,11 +1599,11 @@ class Daemon:
             # unknowable at that point, so reset it -- but note this is now
             # rare, where before it fired on every single dictation.
             self._abandon_in_flight()
-            print("[wispr] Fn tap stopped — rebuilding in 2 s", flush=True)
+            print(f"[wispr] {KEY_NAME} tap stopped — rebuilding in 2 s", flush=True)
             time.sleep(2.0)
 
     def run(self) -> None:
-        if hotkey() == "fn":
+        if hotkey() in ("fn", "right_ctrl"):
             self._run_fn()
             return
         from pynput import keyboard
