@@ -459,7 +459,7 @@ def _activate_target(target_app) -> bool:  # noqa: ANN001
 
 
 def coop_key_enabled() -> bool:
-    """The second Control key talks to Coop. WISPR_COOP_KEY=0 turns it off."""
+    """Fn talks to Coop (Control keeps dictating). WISPR_COOP_KEY=0 turns it off."""
     return os.environ.get("WISPR_COOP_KEY", "1").strip() not in ("0", "false", "off")
 
 
@@ -1537,10 +1537,13 @@ class Daemon:
         RIGHT_CTRL = HK in ("right_ctrl", "left_ctrl")   # = a Control key
         CTRL_KEYCODE = {"left_ctrl": 59, "right_ctrl": 62}.get(HK)
         CTRL_FLAG = Quartz.kCGEventFlagMaskControl
-        # 2026-10-13 (Ary): the OTHER Control key talks to Coop instead of
-        # typing — same mic, same transcription, a grey "Coop" pill, and the
-        # words go to Coop (the overlay answers out loud) rather than pasting.
-        COOP_KEYCODE = {59: 62, 62: 59}.get(CTRL_KEYCODE) if coop_key_enabled() else None
+        # 2026-10-13 (Ary): Fn / globe talks to Coop instead of typing — same
+        # mic, same transcription, a grey "Coop" pill, and the words go to Coop
+        # (the overlay answers out loud) rather than pasting. Right Control was
+        # tried first and never fired on his keyboard. Needs System Settings →
+        # Keyboard → "Press 🌐 key to" = Do Nothing (it is, 10-13).
+        FN_KEYCODE = 63
+        COOP_FN = coop_key_enabled() and CTRL_KEYCODE is not None
         active = [CTRL_KEYCODE]
         HOT_MASK = FN
         KEY_NAME = {"left_ctrl": "Left Control",
@@ -1599,14 +1602,20 @@ class Daemon:
                     if CTRL_KEYCODE is not None:
                         kc = Quartz.CGEventGetIntegerValueField(
                             event, Quartz.kCGKeyboardEventKeycode)
-                        if kc not in (CTRL_KEYCODE, COOP_KEYCODE):
+                        flags = Quartz.CGEventGetFlags(event)
+                        if COOP_FN and kc == FN_KEYCODE:
+                            is_down = bool(flags & FN)       # Fn / globe = Coop
+                        elif kc == CTRL_KEYCODE:
+                            is_down = bool(flags & CTRL_FLAG)
+                        else:
                             return event  # another modifier; state unchanged
                         if down[0] and kc != active[0]:
-                            return event  # the other Control key mid-take: ignore
-                        is_down = bool(Quartz.CGEventGetFlags(event) & CTRL_FLAG)
+                            return event  # the other key mid-take: ignore
                         if is_down and not down[0]:
                             active[0] = kc
-                            self._to_coop = kc == COOP_KEYCODE
+                            self._to_coop = kc == FN_KEYCODE
+                            if self._to_coop:
+                                print("[wispr] Coop key (Fn) down", flush=True)
                     else:
                         is_down = bool(Quartz.CGEventGetFlags(event) & HOT_MASK)
                     if is_down != down[0]:
