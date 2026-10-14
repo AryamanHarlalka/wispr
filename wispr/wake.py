@@ -65,6 +65,7 @@ ANSWER_WAIT_S = 90.0              # give up waiting for the reply after this
 FALLBACK_SPOKE_S = 12.0
 SPEAKING_MAX_S = 45.0              # longest Coop reply before we assume the note was lost           # overlay without speaking/spoke notes: assume done after this
 CALL_POLL_S = 2.0
+REOPEN_GAP_S = 60.0               # never reopen the mic more often than this
 AGC_TARGET = 0.06                 # speech RMS the spotter hears best
 MODEL_DIR = WISPR_HOME / "wake"
 KWS_NAME = "sherpa-onnx-kws-zipformer-gigaspeech-3.3M-2024-01-01"
@@ -492,6 +493,8 @@ class Listener:
         self._last_sp = 0.0
         self._onset_busy = False
         self._onset_hit: tuple | None = None
+        self._onset_text = ""
+        self._onset_verified_at = 0.0
 
     # -- models
     def _spotter(self, strict: bool):
@@ -537,6 +540,7 @@ class Listener:
             with self._lock:
                 if self.m.state == "idle" and not (self.m.muted or self.m.paused or self.m.speaking):
                     log(f"spotted WAKE (onset check: {hit[1]!r})")
+                    self._onset_text, self._onset_verified_at = hit[1], t
                     acts = self.m.keyword("wake", t)
                     pre = min(RING_CHUNKS * CHUNK / SR, t - hit[0] + 0.4)
                     acts = [("start", "wake", max(PREROLL_WAKE_S, pre)) if a[0] == "start" else a
@@ -553,6 +557,10 @@ class Listener:
         sp = bool(self._vad2.is_speech_detected())
         while not self._vad2.empty():
             self._vad2.pop()
+        if sp and self._onset is not None and t - self._onset > 20:
+            self._vad2.reset()                 # 40 s buffer: never let room talk overflow it
+            self._onset, self._last_sp = None, t
+            return
         if sp:
             if self._onset is None and t - self._last_sp >= 0.5:
                 self._onset, self._checked = t - 0.3, False   # silero reports late
@@ -803,15 +811,38 @@ class Listener:
                 log(f"action {a[0]} failed: {e.__class__.__name__}: {e}")
 
     def _process(self, audio: np.ndarray, source: str) -> None:
+        """Turn a capture into one request for Coop.
+
+        A real room has other voices in it (10-14: family talking in Hindi
+        while Ary spoke). Cloud STT then follows the loudest voice and the
+        name disappears from the transcript. Order of trust for a wake:
+        cloud transcript with the name -> English-only local model with the
+        name -> the onset check's own words (Ary's first ~2 s, already
+        verified) -> a bare wake: Coop says "Yes?" and listens."""
         ok = False
         try:
+            onset_text = self._onset_text if time.time() - self._onset_verified_at < 60 else ""
+            self._onset_text, self._onset_verified_at = "", 0.0
             text = transcribe_for_coop(self.d, audio)
             found, rest = strip_wake(text, self.cfg)
             log(f"heard ({source}, {audio.size / SR:.1f}s): {text!r}")
             if source == "wake" and not found:
-                self.stats["rejected"] += 1
-                log("no wake phrase in the transcript — dropped as a false wake")
-                rest = ""
+                local = _local_text(audio)
+                lf, lrest = strip_wake(local, self.cfg)
+                log(f"local check: {local!r}")
+                if lf:
+                    found, rest = True, lrest
+                elif onset_text:
+                    found = True
+                    rest = strip_wake(onset_text, self.cfg)[1]
+                    if not rest:
+                        w = _words(onset_text)
+                        rest = " ".join(w[2:]) if len(w) > 2 else ""
+                    log(f"using the onset words: {rest!r}")
+                else:
+                    self.stats["rejected"] += 1
+                    log("no wake phrase in the transcript — dropped as a false wake")
+                    rest = ""
             if rest and is_pause(rest, self.cfg):
                 with self._lock:
                     self._run(self.m.pause(time.time()))
@@ -823,6 +854,10 @@ class Listener:
                 self.stats["sent"] += ok
                 self.d.indicator.set("coop" if ok else "error",
                                      f"{len(rest.split())}w" if ok else "Coop isn't running")
+            elif found:
+                # "Hey Coop" and nothing else: answer, then the follow-up window listens
+                ok = self.note("say", "Yes?")
+                self.d.indicator.hide()
         except Exception as e:
             log(f"pipeline failed: {e.__class__.__name__}: {e}")
         finally:
@@ -872,11 +907,19 @@ class Listener:
                 chunk = None
             t = time.time()
             if chunk is None:
-                if t - self.last_audio > 5.0:
-                    log("mic went quiet (stream wedged?) — reopening")
+                if t - self.last_audio > 5.0 and t - getattr(self, "_last_reopen", 0.0) > REOPEN_GAP_S:
+                    # Each open asks coreaudiod for locked memory; reopening every
+                    # few seconds exhausted it on 10-14 (mlock errno 35) and broke
+                    # every mic app until the audio service restarted. Back off hard.
+                    self._last_reopen = t
+                    self._reopens = getattr(self, "_reopens", 0) + 1
+                    log(f"mic went quiet — reopening (try {self._reopens})")
                     self._close()
                     time.sleep(0.5)
-                    self._open()
+                    try:
+                        self._open()
+                    except Exception as e:
+                        log(f"reopen failed: {e.__class__.__name__}: {e}")
                     self.last_audio = time.time()
                 continue
             self.last_audio = t
@@ -910,6 +953,9 @@ class Listener:
             self._run(acts)
             if muted:
                 was_muted = True
+                if DEBUG_FILE.exists() and t - getattr(self, "_dbg_m", 0.0) > 5.0:
+                    self._dbg_m = t
+                    log(f"debug: muted held={self.m.held} call={self.m.call} recording={getattr(self.d, 'recording', None)}")
                 continue
             if was_muted:
                 streams = {k: v.create_stream() for k, v in kws.items()}
@@ -989,6 +1035,21 @@ _LISTENER: Listener | None = None
 _ONSET_MODEL = None
 
 
+def _local_text(audio: np.ndarray) -> str:
+    """English-only local transcript (base.en), biased to the name."""
+    try:
+        rms = float(np.sqrt(np.mean(audio * audio))) if audio.size else 0.0
+        g = max(1.0, min(8.0, 0.08 / max(rms, 1e-4)))
+        segs, _ = _onset_model().transcribe(np.clip(audio * g, -1, 1).astype(np.float32),
+                                            language="en", beam_size=1, vad_filter=True,
+                                            initial_prompt="Hey Coop.",
+                                            condition_on_previous_text=False)
+        return " ".join(x.text.strip() for x in segs).strip()
+    except Exception as e:
+        log(f"local check failed: {e.__class__.__name__}: {e}")
+        return ""
+
+
 def _onset_model():
     """faster-whisper base.en, int8, 2 threads; loaded on first onset."""
     global _ONSET_MODEL
@@ -1040,7 +1101,7 @@ def start(daemon, prefix: str = "com.aryaman.coop.overlay") -> None:  # noqa: AN
                 except Exception:
                     pass
             time.sleep(delay)
-            delay = min(10.0, delay * 2)
+            delay = min(60.0, delay * 2)
 
     threading.Thread(target=loop, daemon=True, name="wispr-wake").start()
 

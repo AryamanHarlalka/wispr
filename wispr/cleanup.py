@@ -263,7 +263,6 @@ def _haiku_call(transcript: str, mode: str, vocab: list[str],
     msg = client.messages.create(
         model=HAIKU_MODEL,
         max_tokens=1024,
-        temperature=0,
         system=system,
         stop_sequences=["</clean>"],
         messages=[
