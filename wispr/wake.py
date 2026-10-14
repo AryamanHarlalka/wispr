@@ -60,7 +60,8 @@ NO_SPEECH_S = 5.0                 # after a bare wake phrase, wait this long for
 AFTER_FIRE_S = 0.15               # speech this long after the fire counts as the request
 ECHO_TAIL_S = 0.5                 # room tail after the assistant stops talking
 ANSWER_WAIT_S = 90.0              # give up waiting for the reply after this
-FALLBACK_SPOKE_S = 12.0           # overlay without speaking/spoke notes: assume done after this
+FALLBACK_SPOKE_S = 12.0
+SPEAKING_MAX_S = 45.0              # longest Coop reply before we assume the note was lost           # overlay without speaking/spoke notes: assume done after this
 CALL_POLL_S = 2.0
 AGC_TARGET = 0.06                 # speech RMS the spotter hears best
 MODEL_DIR = WISPR_HOME / "wake"
@@ -198,6 +199,7 @@ class Machine:
         self.paused = False
         self.speaking = False
         self.saw_speaking_note = False
+        self.speaking_since = 0.0
         self.spoke_at = 0.0
         self.fire_t = 0.0
         self.cap_t = 0.0
@@ -278,6 +280,10 @@ class Machine:
 
     # -- clock
     def tick(self, t: float) -> list:
+        # Never trust the overlay to say it finished: a missed `spoke` note
+        # left the spotter in its strict over-Coop mode for hours (10-14).
+        if self.speaking and t - self.speaking_since >= SPEAKING_MAX_S:
+            return self.spoke(t)
         if self.state == "capture":
             if t - self.cap_t >= self.cfg.max_s:
                 return self._end()
@@ -294,6 +300,7 @@ class Machine:
                 return self.spoke(t)
             if t - self.answer_t >= ANSWER_WAIT_S:
                 self.state = "idle"
+                self.speaking = False
         return []
 
     def _end(self) -> list:
@@ -320,6 +327,7 @@ class Machine:
     def speaking_note(self, t: float) -> list:
         self.saw_speaking_note = True
         self.speaking = True
+        self.speaking_since = t
         return []
 
     def spoke(self, t: float) -> list:
@@ -629,7 +637,7 @@ class Listener:
         with self._lock:
             if kind == "speaking":
                 acts = self.m.speaking_note(t)
-                if self._end_t:
+                if self._end_t and t - self._end_t < 120:
                     log(f"latency: end of speech -> Coop answering {int((t - self._end_t) * 1000)} ms")
                     self._first_audio_pending = True
             elif kind == "spoke":
@@ -816,7 +824,7 @@ class Listener:
                 muted = self.m.muted
                 strict = self.m.strict()
                 want_vad = self.m.wants_vad()
-                if self._first_audio_pending and self.m.speaking:
+                if self._first_audio_pending and self.m.speaking and t - self._end_t < 120:
                     if float(np.sqrt(np.mean(chunk * chunk))) > 0.01:
                         log(f"latency: end of speech -> Coop's voice in the room "
                             f"{int((t - self._end_t) * 1000)} ms")
