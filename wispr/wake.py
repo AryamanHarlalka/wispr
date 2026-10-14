@@ -56,6 +56,8 @@ SR = 16000
 CHUNK = 1600                      # 100 ms
 PREROLL_WAKE_S = 2.2              # audio before the fire kept for STT (holds the phrase)
 PREROLL_FOLLOW_S = 0.6
+RING_CHUNKS = 80                  # 8 s of raw audio kept for pre-roll
+GREETINGS = {"hey", "hi", "hay", "okay", "ok", "yo", "hello"}
 NO_SPEECH_S = 5.0                 # after a bare wake phrase, wait this long for the request
 AFTER_FIRE_S = 0.15               # speech this long after the fire counts as the request
 ECHO_TAIL_S = 0.5                 # room tail after the assistant stops talking
@@ -483,6 +485,13 @@ class Listener:
         self._end_t = 0.0
         self._listen_sent_at = 0.0
         self._first_audio_pending = False
+        # second detector: a local Whisper check on the start of each utterance
+        self._vad2 = None
+        self._onset: float | None = None
+        self._checked = False
+        self._last_sp = 0.0
+        self._onset_busy = False
+        self._onset_hit: tuple | None = None
 
     # -- models
     def _spotter(self, strict: bool):
@@ -514,6 +523,74 @@ class Listener:
         c.sample_rate = SR
         c.num_threads = 1
         return sherpa_onnx.VoiceActivityDetector(c, buffer_size_in_seconds=40)
+
+    # -- second detector: Whisper on utterance onsets
+    # The 3.3M spotter caught 1 of 2 real "Hey Coop"s from Ary at any
+    # sensitivity (10-14 recording); base.en on the first ~2 s of each
+    # utterance caught 2 of 2 in ~220 ms. Runs only on speech onsets after
+    # a pause (music and steady talk cost nothing), only while idle.
+    def _onset_step(self, chunk: np.ndarray, t: float) -> None:
+        if not getattr(self.cfg, "onsets", True) or self._vad2 is None:
+            return
+        hit, self._onset_hit = self._onset_hit, None
+        if hit is not None:
+            with self._lock:
+                if self.m.state == "idle" and not (self.m.muted or self.m.paused or self.m.speaking):
+                    log(f"spotted WAKE (onset check: {hit[1]!r})")
+                    acts = self.m.keyword("wake", t)
+                    pre = min(RING_CHUNKS * CHUNK / SR, t - hit[0] + 0.4)
+                    acts = [("start", "wake", max(PREROLL_WAKE_S, pre)) if a[0] == "start" else a
+                            for a in acts]
+                    self._run(acts)
+            self._onset = None
+            return
+        with self._lock:
+            idle = self.m.state == "idle" and not (self.m.muted or self.m.paused or self.m.speaking)
+        if not idle:
+            self._onset = None
+            return
+        self._vad2.accept_waveform(chunk)
+        sp = bool(self._vad2.is_speech_detected())
+        while not self._vad2.empty():
+            self._vad2.pop()
+        if sp:
+            if self._onset is None and t - self._last_sp >= 0.5:
+                self._onset, self._checked = t - 0.3, False   # silero reports late
+            self._last_sp = t
+        if self._onset is not None and not self._checked:
+            dur = t - self._onset
+            ended = not sp and t - self._last_sp >= 0.3
+            if dur >= 2.2 or (ended and dur >= 0.5):
+                self._checked = True
+                if not self._onset_busy:
+                    n = int(min(dur + 0.4, 2.8) * SR / CHUNK) + 1
+                    clip = np.concatenate(self.ring[-n:])
+                    self._onset_busy = True
+                    threading.Thread(target=self._check_onset, args=(clip, self._onset),
+                                     daemon=True, name="wispr-wake-onset").start()
+        if self._onset is not None and not sp and t - self._last_sp >= 0.6:
+            self._onset = None
+
+    def _check_onset(self, clip: np.ndarray, onset: float) -> None:
+        try:
+            m = _onset_model()
+            rms = float(np.sqrt(np.mean(clip * clip))) if clip.size else 0.0
+            g = max(1.0, min(8.0, 0.08 / max(rms, 1e-4)))
+            segs, _ = m.transcribe(np.clip(clip * g, -1, 1).astype(np.float32), language="en",
+                                   beam_size=1, vad_filter=False, initial_prompt="Hey Coop.",
+                                   condition_on_previous_text=False, without_timestamps=True)
+            txt = " ".join(x.text.strip() for x in segs).strip()
+            w = [x.lower() for x in _words(txt)]
+            names = {sound_key(p.split()[-1]) for p in self.cfg.phrases if p.split()}
+            names |= {sound_key(a) for a in self.cfg.aliases}
+            if len(w) >= 2 and w[0] in GREETINGS and sound_key(w[1]).rstrip("V") in names:
+                self._onset_hit = (onset, txt)
+            elif DEBUG_FILE.exists():
+                log(f"debug: onset heard {txt!r}")
+        except Exception as e:
+            log(f"onset model: {e.__class__.__name__}: {e}")
+        finally:
+            self._onset_busy = False
 
     # -- level
     def _agc(self, chunk: np.ndarray) -> np.ndarray:
@@ -781,6 +858,7 @@ class Listener:
         threading.Thread(target=self._observe, daemon=True, name="wispr-wake-notes").start()
         kws = {False: self._spotter(False), True: self._spotter(True)}
         vad = self._vad()
+        self._vad2 = self._vad()
         streams = {k: v.create_stream() for k, v in kws.items()}
         self._open()
         next_poll = 0.0
@@ -806,8 +884,8 @@ class Listener:
                 from .daemon import _resample_to_16k
                 chunk = _resample_to_16k(chunk, self.rate)
             self.ring.append(chunk)
-            if len(self.ring) > 30:
-                del self.ring[:-30]
+            if len(self.ring) > RING_CHUNKS:
+                del self.ring[:-RING_CHUNKS]
             if self.capturing:
                 self.cap.append(chunk)
             with self._lock:
@@ -866,6 +944,10 @@ class Listener:
                     while not vad.empty():
                         vad.pop()
                 self._run(self.m.tick(t))
+            try:
+                self._onset_step(chunk, t)
+            except Exception as e:
+                log(f"onset check: {e.__class__.__name__}: {e}")
 
 
 def transcribe_for_coop(daemon, audio: np.ndarray) -> str:  # noqa: ANN001
@@ -904,6 +986,16 @@ def transcribe_for_coop(daemon, audio: np.ndarray) -> str:  # noqa: ANN001
 
 
 _LISTENER: Listener | None = None
+_ONSET_MODEL = None
+
+
+def _onset_model():
+    """faster-whisper base.en, int8, 2 threads; loaded on first onset."""
+    global _ONSET_MODEL
+    if _ONSET_MODEL is None:
+        from faster_whisper import WhisperModel
+        _ONSET_MODEL = WhisperModel("base.en", device="cpu", compute_type="int8", cpu_threads=2)
+    return _ONSET_MODEL
 _OBS_CLASS = None
 _OBS_STARTED = False
 
