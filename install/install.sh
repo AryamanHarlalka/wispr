@@ -262,6 +262,17 @@ launchctl unload  "$PLIST_DST"      2>/dev/null || true
 # The bundled interpreter cannot find its own stdlib or the venv by relative
 # path, so both are passed explicitly.
 PYHOME="$("$PY" -c 'import sys; print(sys.base_prefix)')"
+# Pin the interpreter to Wispr's own copy (2026-10-23). It used to point
+# at whatever Python built the venv (python.org framework, then a Hermes
+# tool dir); when that was upgraded or moved, Wispr died at boot with
+# "No module named 'encodings'". Nothing else may own Wispr's runtime.
+case "$PYHOME" in
+  "$HOME/.wispr/runtime/"*) ;;
+  *) PIN="$HOME/.wispr/runtime/$(basename "$PYHOME")"
+     mkdir -p "$HOME/.wispr/runtime"
+     [[ -d "$PIN" ]] || cp -Rp "$PYHOME" "$PIN"
+     PYHOME="$PIN" ;;
+esac
 PYVER_SHORT="$("$PY" -c 'import sys; print("%d.%d" % sys.version_info[:2])')"
 PYPATH="$VENV/lib/python$PYVER_SHORT/site-packages:$REPO"
 

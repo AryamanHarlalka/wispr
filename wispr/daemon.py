@@ -81,113 +81,269 @@ def _resample_to_16k(audio: np.ndarray, src_rate: int) -> np.ndarray:
 
 
 class Recorder:
-    def __init__(self) -> None:
+    """Always-warm microphone (2026-10-23 — the "once and for all" fix).
+
+    Root cause of Wispr breaking over and over: every dictation opened a
+    fresh CoreAudio stream on the USB mic (Blue Snowball) and closed it on
+    release. Hundreds of open/close cycles a day wedge the USB device or
+    coreaudiod: AUHAL -10851, 'what' (kAudioHardwareUnspecifiedError),
+    PaErrorCode -9986, or a stream that opens and delivers nothing. The
+    previous patches (PortAudio reinit, killall coreaudiod, self-kickstart)
+    all ran *on the key press*, so the take was lost every time anyway.
+
+    Now ONE stream is opened at the device's native rate and kept open.
+    A press only flips a flag — nothing touches CoreAudio on the hot path.
+    A supervisor thread watches the callback heartbeat and reopens in the
+    background after an unplug, sleep/wake or coreaudiod restart. If it
+    cannot recover in-process, it exits non-zero so launchd relaunches a
+    fresh process (a fresh process recovers where reinit can't), and only
+    as a last resort, at most every 30 min, restarts coreaudiod.
+    A 0.4 s pre-roll means the first syllable is never clipped.
+
+    Trade-off: macOS shows the orange mic dot while Wispr runs. Audio is
+    discarded unless the hotkey is held. [audio] keep_warm = false goes back
+    to open-per-press.
+    """
+    HEARTBEAT_S = 1.5
+    PREROLL_S = 0.4
+    GIVE_UP_S = 45.0
+    RELAUNCH_COOLDOWN_S = 600.0
+    COREAUDIO_COOLDOWN_S = 1800.0
+
+    def __init__(self, supervise: bool | None = None) -> None:
         import sounddevice as sd
         self._sd = sd
-        self._frames: list[np.ndarray] = []
-        self._stream = None
-        self.level = 0.0
-        # Rate we actually captured at; may differ from SAMPLE_RATE when the
-        # device refused 16 kHz. Everything downstream still gets 16 kHz.
-        self._capture_rate = SAMPLE_RATE
-
-    def _device_default_rate(self) -> int:
+        cfg = {}
         try:
-            return int(self._sd.query_devices(kind="input")["default_samplerate"])
+            from .config import load_config
+            cfg = load_config().get("audio", {}) or {}
+        except Exception:
+            pass
+        self._device_hint = str(cfg.get("device", "") or "").strip()
+        self.keep_warm = bool(cfg.get("keep_warm", True))
+        self._frames: list[np.ndarray] = []
+        self._preroll: list[np.ndarray] = []
+        self._preroll_n = 0
+        self._buf_lock = threading.Lock()
+        self._io_lock = threading.RLock()
+        self._capturing = False
+        self._stream = None
+        self._rate = SAMPLE_RATE
+        self._capture_rate = SAMPLE_RATE
+        self._last_cb = 0.0
+        self._down_since: float | None = None
+        self.preroll_s_used = 0.0
+        self.level = 0.0
+        if supervise is None:
+            supervise = self.keep_warm
+        if supervise:
+            threading.Thread(target=self._supervise, name="wispr-mic",
+                             daemon=True).start()
+
+    # --- stream lifecycle -------------------------------------------------
+    def _cb(self, indata, frames, t, status):  # noqa: ANN001
+        self._last_cb = time.monotonic()
+        chunk = indata.copy()
+        with self._buf_lock:
+            if self._capturing:
+                self._frames.append(chunk)
+                self.level = float(np.abs(chunk).mean())
+                return
+            self._preroll.append(chunk)
+            self._preroll_n += len(chunk)
+            limit = int(self._rate * self.PREROLL_S)
+            while self._preroll and self._preroll_n - len(self._preroll[0]) >= limit:
+                self._preroll_n -= len(self._preroll.pop(0))
+
+    def healthy(self) -> bool:
+        return (self._stream is not None
+                and time.monotonic() - self._last_cb < self.HEARTBEAT_S)
+
+    def _pick_device(self):  # noqa: ANN202
+        """Configured device by name substring, else the system default."""
+        if not self._device_hint:
+            return None
+        try:
+            for i, dv in enumerate(self._sd.query_devices()):
+                if (dv.get("max_input_channels", 0) > 0
+                        and self._device_hint.lower() in dv["name"].lower()):
+                    return i
+        except Exception:
+            pass
+        return None
+
+    def _device_default_rate(self, device=None) -> int:  # noqa: ANN001
+        try:
+            info = self._sd.query_devices(device if device is not None else None,
+                                          kind=None if device is not None else "input")
+            return int(info["default_samplerate"])
         except Exception:
             return 48000
 
-    def start(self) -> None:
-        self._frames = []
-        self._capture_rate = SAMPLE_RATE
-
-        def cb(indata, frames, t, status):  # noqa: ANN001
-            self._frames.append(indata.copy())
-            self.level = float(np.abs(indata).mean())
-
-        try:
-            self._open_stream(cb)
-        except Exception as e:
-            # Before tearing PortAudio down, try the device's own rate: on
-            # a 96 kHz built-in mic, asking for 16 kHz is itself the error,
-            # and reinitialising PortAudio would not have helped.
-            native = self._device_default_rate()
-            if native != SAMPLE_RATE:
-                try:
-                    self._open_stream(cb, rate=native)
-                    self._capture_rate = native
-                    print(f"[wispr] device refused {SAMPLE_RATE} Hz; capturing "
-                          f"at {native} Hz and resampling "
-                          f"({e.__class__.__name__})", flush=True)
-                    return
-                except Exception:
-                    pass
-            # CoreAudio/PortAudio wedges in practice — PaErrorCode -9986
-            # ("Internal PortAudio error") and AUHAL -10851 ("Invalid
-            # Property Value") both show up after a device change, a
-            # sleep/wake cycle, or another process holding the input
-            # device. PortAudio's host-API state is process-global, so a
-            # plain retry hits the same wedged state; tearing it down and
-            # re-initialising usually clears it.
-            print(f"[wispr] input stream failed "
-                  f"({e.__class__.__name__}: {e}) — reinitialising "
-                  f"PortAudio and retrying once", flush=True)
-            self._reset_portaudio()
+    def _close(self) -> None:
+        s, self._stream = self._stream, None
+        if s is not None:
             try:
-                self._open_stream(cb)  # a second failure propagates to _start()
+                s.stop()
             except Exception:
-                # Last resort: native rate after the reinit.
-                native = self._device_default_rate()
-                if native == SAMPLE_RATE:
-                    raise
-                self._open_stream(cb, rate=native)
-                self._capture_rate = native
+                pass
+            try:
+                s.close()
+            except Exception:
+                pass
 
-    def _open_stream(self, cb, rate: int | None = None) -> None:  # noqa: ANN001
-        self._stream = self._sd.InputStream(
-            samplerate=rate or SAMPLE_RATE, channels=1, dtype="float32",
-            callback=cb)
-        self._stream.start()
+    def _open_once(self) -> None:
+        dev = self._pick_device()
+        rate = self._device_default_rate(dev)
+        self._rate = rate
+        self._last_cb = 0.0
+        s = self._sd.InputStream(device=dev, samplerate=rate, channels=1,
+                                 dtype="float32", callback=self._cb)
+        s.start()
+        self._stream = s
+        # A wedged USB mic can open without error yet never deliver.
+        deadline = time.monotonic() + 1.0
+        while self._last_cb == 0.0 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        if self._last_cb == 0.0:
+            self._close()
+            raise RuntimeError("input stream opened but delivered no audio")
+        try:
+            name = self._sd.query_devices(dev, kind=None if dev is not None else "input")["name"]
+        except Exception:
+            name = "?"
+        print(f"[wispr] mic open: {name} @ {rate} Hz (kept warm)", flush=True)
+
+    def _open(self, force: bool = False) -> None:
+        """Open (or reopen) the warm stream. First a plain open; if that
+        fails, re-initialise PortAudio (refreshes its cached device list —
+        needed after unplug/replug) and try once more."""
+        with self._io_lock:
+            if not force and self.healthy():
+                return
+            self._close()
+            try:
+                self._open_once()
+                return
+            except Exception as e:
+                print(f"[wispr] mic open failed ({e.__class__.__name__}: "
+                      f"{str(e)[:80]}) — refreshing PortAudio", flush=True)
+            self._reset_portaudio()
+            self._open_once()
 
     def _reset_portaudio(self) -> None:
         """Tear down and re-initialise the process-global PortAudio host
-        API. Best-effort: never raises, so the retry in start() is what
-        decides whether recording actually recovered."""
+        API. Best-effort: never raises."""
         try:
-            if self._stream is not None:
-                try:
-                    self._stream.close()
-                except Exception:
-                    pass
-                self._stream = None
+            self._close()
             self._sd._terminate()
-            time.sleep(0.15)
+            time.sleep(0.25)
             self._sd._initialize()
         except Exception as e:
             print(f"[wispr] PortAudio reinit failed: "
                   f"{e.__class__.__name__}: {e}", flush=True)
 
-    def stop(self) -> np.ndarray:
-        if self._stream:
-            self._stream.stop()
-            self._stream.close()
-            self._stream = None
-        if not self._frames:
-            return np.zeros(0, dtype="float32")
-        return _resample_to_16k(
-            np.concatenate(self._frames).flatten(), self._capture_rate)
+    def _supervise(self) -> None:
+        backoff = 1.0
+        while True:
+            time.sleep(0.5)
+            if self.healthy():
+                self._down_since = None
+                backoff = 1.0
+                continue
+            if self._down_since is None:
+                self._down_since = time.monotonic()
+                if self._stream is not None:
+                    print("[wispr] mic went quiet (unplug/sleep/coreaudiod) "
+                          "— reopening in background", flush=True)
+            try:
+                self._open()
+                continue
+            except Exception as e:
+                print(f"[wispr] mic still unavailable: {e.__class__.__name__}: "
+                      f"{str(e)[:80]}", flush=True)
+            if time.monotonic() - self._down_since > self.GIVE_UP_S:
+                self._escalate()
+                self._down_since = time.monotonic()
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 8.0)
 
-    def snapshot(self) -> np.ndarray:
-        """Everything recorded so far, without stopping the stream (B3) —
-        lets the incremental decoder peek at in-progress audio. Safe to call
-        from another thread: the sounddevice callback only appends new
-        arrays to `_frames`, never mutates existing ones, so `list(...)`
-        here can't observe a torn read under the GIL."""
-        frames = list(self._frames)
+    def _escalate(self) -> None:
+        """In-process recovery failed for GIVE_UP_S. Relaunch a fresh
+        process via launchd (exit 75; KeepAlive restarts non-zero exits),
+        at most every 10 min; restart coreaudiod at most every 30 min."""
+        import json
+        p = WISPR_HOME / "mic-recovery.json"
+        try:
+            st = json.loads(p.read_text())
+        except Exception:
+            st = {}
+        now = time.time()
+        if now - st.get("relaunch", 0) > self.RELAUNCH_COOLDOWN_S:
+            st["relaunch"] = now
+            action = "relaunch"
+        elif now - st.get("coreaudiod", 0) > self.COREAUDIO_COOLDOWN_S:
+            st["coreaudiod"] = now
+            st["relaunch"] = now
+            action = "coreaudiod"
+        else:
+            print("[wispr] mic down; recovery cooldowns active — still "
+                  "retrying in background", flush=True)
+            return
+        try:
+            p.write_text(json.dumps(st))
+        except Exception:
+            pass
+        if action == "coreaudiod":
+            try:
+                r = subprocess.run(["/usr/bin/sudo", "-n", "/usr/bin/killall",
+                                    "usbaudiod", "coreaudiod"],
+                                   capture_output=True, timeout=8)
+                print(f"[wispr] restarted coreaudiod (rc={r.returncode})", flush=True)
+                time.sleep(3.0)
+            except Exception as e:
+                print(f"[wispr] coreaudiod restart failed: {e}", flush=True)
+        print("[wispr] mic unrecoverable in-process — relaunching Wispr "
+              "via launchd", flush=True)
+        os._exit(75)
+
+    # --- the hot path: flag flips only -------------------------------------
+    def start(self) -> None:
+        if not self.healthy():
+            # One synchronous attempt so this press still works if the
+            # supervisor hasn't caught up yet (or keep_warm is off).
+            try:
+                self._open()
+            except Exception as e:
+                raise RuntimeError(f"mic reconnecting ({e.__class__.__name__})") from e
+        with self._buf_lock:
+            self._frames = list(self._preroll)
+            self.preroll_s_used = self._preroll_n / float(self._rate or SAMPLE_RATE)
+            self._preroll = []
+            self._preroll_n = 0
+            self._capture_rate = self._rate
+            self._capturing = True
+
+    def stop(self) -> np.ndarray:
+        with self._buf_lock:
+            was = self._capturing
+            self._capturing = False
+            frames, self._frames = self._frames, []
+        self.level = 0.0
+        if was and not self.keep_warm:
+            with self._io_lock:
+                self._close()
         if not frames:
             return np.zeros(0, dtype="float32")
-        # Must match stop()'s output rate: the incremental decoder feeds the
-        # same model, which assumes 16 kHz.
+        return _resample_to_16k(
+            np.concatenate(frames).flatten(), self._capture_rate)
+
+    def snapshot(self) -> np.ndarray:
+        """Everything recorded so far, without stopping (B3)."""
+        with self._buf_lock:
+            frames = list(self._frames)
+        if not frames:
+            return np.zeros(0, dtype="float32")
         return _resample_to_16k(
             np.concatenate(frames).flatten(), self._capture_rate)
 
@@ -972,7 +1128,8 @@ class Daemon:
                     audio, str(Path(_dump_dir) / f"dump_{int(time.time())}.wav"))
             except Exception:
                 pass
-        if audio.size < SAMPLE_RATE * 0.3:  # <0.3 s: accidental tap
+        _pre = int(SAMPLE_RATE * getattr(self.recorder, "preroll_s_used", 0.0))
+        if audio.size - _pre < SAMPLE_RATE * 0.3:  # <0.3 s spoken: accidental tap
             if incremental is not None:
                 incremental.stop()
             print("[wispr] take dropped: only %.2fs of audio (a stray tap, "
