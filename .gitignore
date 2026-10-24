@@ -31,3 +31,7 @@ build/
 # Editor/scratch leftovers
 *.bak
 .exp/
+
+# Local daemon snapshots and personal bench experiments (stay on this machine)
+wispr/*.pre-*
+bench/ab_cloud.py
