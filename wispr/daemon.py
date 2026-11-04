@@ -19,7 +19,7 @@ from pathlib import Path
 
 import numpy as np
 
-from . import (cleanup, cloud_stt, dictionary as dict_mod, history, learn as learn_mod,
+from . import (cleanup, cloud_stt, engine_stt, dictionary as dict_mod, history, learn as learn_mod,
                modes as modes_mod, stt, vocab as vocab_mod)
 from .config import (WISPR_HOME, cleanup_wait_s, ensure_home, learn_from_edits,
                      learn_from_llm, load_corrections, load_modes,
@@ -1081,15 +1081,21 @@ class Daemon:
         # Open the TLS connection while the user is still speaking so the
         # Haiku call after key-release starts on a warm connection (B1).
         cleanup.prewarm_connection()
-        cloud_stt.prewarm()
         self.recorder.start()
+        # after the mic is open: never delay the first words (the check is cached anyway)
+        engine_up = engine_stt.enabled()
+        if not engine_up:
+            cloud_stt.prewarm()
         # B3: start decoding in the background while the user keeps
         # talking, so long (hands-free) dictations only pay for the tail
         # on release instead of the whole recording.
-        self._incremental = IncrementalTranscriber(
-            self.model, self._model_lock, self.vocab, self.corrections,
-            self.dictionary)
-        self._incremental.start(self.recorder)
+        # 2026-11-05: skipped while the voice engine is up — it transcribes a
+        # minute of audio in well under a second, so there is no tail to save.
+        if not engine_up:
+            self._incremental = IncrementalTranscriber(
+                self.model, self._model_lock, self.vocab, self.corrections,
+                self.dictionary)
+            self._incremental.start(self.recorder)
         # B4: feed Recorder.level to the pill's waveform while listening —
         # a small standalone thread (like the incremental worker above),
         # not a restructuring of the existing hotkey/_process threading.
@@ -1195,7 +1201,24 @@ class Daemon:
             dur_s = audio.size / SAMPLE_RATE
             stt_engine, stt_note = "local", ""
             cloud_fut = None
-            if cloud_stt.enabled():
+            local_fut = None
+            # 2026-11-05: the on-device voice engine (voiced, Parakeet family on
+            # the Neural Engine) is the primary path. See engine_stt.py.
+            engine_raw = None
+            if engine_stt.enabled():
+                try:
+                    r = engine_stt.transcribe(audio)
+                    engine_raw = (r.get("text") or "").strip()
+                    stt_engine = f"engine:{r.get('model', '?')}"
+                    stt_note = (f"ok {r.get('ms', 0)}ms "
+                                f"speech={r.get('speechSeconds', 0):.1f}s")
+                    if r.get("notes"):
+                        stt_note += " " + "; ".join(r["notes"])
+                except engine_stt.EngineUnavailable as e:
+                    stt_note = f"engine down: {str(e)[:60]}"
+                    print(f"[wispr] voice engine unavailable -> fallback ({e})",
+                          flush=True)
+            if engine_raw is None and cloud_stt.enabled():
                 try:
                     prompt = cloud_stt.build_prompt(
                         dict_mod.prompt_terms(self.vocab, self.corrections,
@@ -1205,9 +1228,12 @@ class Daemon:
                                                  audio, prompt)
                 except Exception as e:
                     stt_note = f"cloud submit failed: {e}"
-            local_fut = _STT_POOL.submit(self._local_transcribe, audio,
-                                         incremental)
-            raw = None
+            if engine_raw is None:
+                local_fut = _STT_POOL.submit(self._local_transcribe, audio,
+                                             incremental)
+            elif incremental is not None:
+                incremental.stop()
+            raw = engine_raw
             if cloud_fut is not None:
                 try:
                     text, stt_note = cloud_fut.result(
@@ -1221,6 +1247,13 @@ class Daemon:
                           flush=True)
             if raw is None:
                 raw = local_fut.result()
+            if raw and not stt_engine.startswith("engine:"):
+                # Decoder-model output (cloud or base.en): drop silence
+                # phrases, subtitle credits and repeating loops.
+                g = engine_stt.guard(raw, None, "decoder")
+                if g["notes"]:
+                    stt_note = (stt_note + " guard: " + "; ".join(g["notes"]))[:120]
+                raw = g["text"]
             t_whisper = time.time()
             if stt_engine == "local" and not raw:
                 raw = ""
