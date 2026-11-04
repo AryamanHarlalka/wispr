@@ -144,6 +144,9 @@ def load_learned() -> dict[str, str]:
                 continue
             parts = ln.split("\t")
             if len(parts) >= 2 and parts[0].strip() and parts[1].strip():
+                src = parts[2].strip() if len(parts) > 2 else ""
+                if src.startswith("llm") and _real_words(parts[0].strip(), parts[1].strip()):
+                    continue   # a model's guess that rewrites real words: never applied (see learn)
                 out[parts[0].strip()] = parts[1].strip()
     except OSError:
         pass
@@ -170,6 +173,39 @@ def _write_learned(rows: list[list[str]]) -> None:
         header + "".join("\t".join(r) + "\n" for r in rows), encoding="utf-8")
 
 
+_WORDS: set[str] | None = None
+
+
+def _english() -> set[str]:
+    """The system word list (macOS /usr/share/dict/words), lower-cased, cached. Empty when absent."""
+    global _WORDS
+    if _WORDS is None:
+        try:
+            from pathlib import Path
+            _WORDS = {w.strip().lower() for w in Path("/usr/share/dict/words").read_text(errors="ignore").split()}
+        except OSError:
+            _WORDS = set()
+    return _WORDS
+
+
+def _squash(t: str) -> str:
+    return re.sub(r"[\s\-_.]+", "", t.lower())
+
+
+def _real_words(wrong: str, right: str) -> bool:
+    """True when `wrong` is ordinary speech (every token an English word or a number) that is not just `right`
+    spelled apart ("acme co" -> "AcmeCo" is spacing, not a swap). A model guessing that a real word was a misheard
+    name turns everyday words into product names; those are never learned."""
+    if _squash(wrong) == _squash(right):
+        return False
+    toks = re.findall(r"[A-Za-z]+|\d+", wrong)
+    words = _english()
+    if not toks or not words:
+        return False
+    known = lambda t: t.lower() in words or (t.lower().endswith('s') and t.lower()[:-1] in words)
+    return all(t.isdigit() or known(t) for t in toks)
+
+
 def learn(wrong: str, right: str, source: str, add_term: bool = True) -> bool:
     """An observed correction. Stores/reinforces the pair and, when
     `add_term` and the right-hand side looks like a term, adds it to the
@@ -181,6 +217,9 @@ def learn(wrong: str, right: str, source: str, add_term: bool = True) -> bool:
     if len(wrong) > 60 or len(right) > 60:
         return False
     if _norm(wrong) in {_norm(w) for w in load_dictionary()}:
+        return False
+    # Only a person's own edit may turn real words into a name; a model's guess may not (2026-11-04).
+    if source.startswith("llm") and _real_words(wrong, right):
         return False
     rows = _learned_rows()
     stamp = time.strftime("%Y-%m-%d")
