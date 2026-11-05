@@ -48,6 +48,27 @@ BEAM_SIZE = stt_beam_size()
 CONDITION_ON_PREVIOUS_TEXT = False
 
 
+class _LazyModel:
+    """The local Whisper backend, built on first use (or in the background)."""
+
+    def __init__(self) -> None:
+        self._m = None
+        self._lock = threading.Lock()
+
+    def get(self):
+        with self._lock:
+            if self._m is None:
+                print(f"[wispr] loading {BACKEND_NAME}/{MODEL_NAME} …", flush=True)
+                self._m = stt.build_backend(BACKEND_NAME, MODEL_NAME)
+            return self._m
+
+    def load_in_background(self) -> None:
+        threading.Thread(target=self.get, daemon=True, name="wispr-model-load").start()
+
+    def transcribe(self, *args, **kwargs):
+        return self.get().transcribe(*args, **kwargs)
+
+
 def _resample_to_16k(audio: np.ndarray, src_rate: int) -> np.ndarray:
     """Downsample captured audio to SAMPLE_RATE.
 
@@ -1009,8 +1030,12 @@ class Daemon:
         # path so the first real dictation doesn't pay it (B1).
         cleanup.warm_client()
 
-        print(f"[wispr] loading {BACKEND_NAME}/{MODEL_NAME} …", flush=True)
-        self.model = stt.build_backend(BACKEND_NAME, MODEL_NAME)
+        # 2026-11-05: the Whisper fallback loads only when the voice engine is down (in the
+        # background) or on first use. A relaunch used to spend seconds loading it before the
+        # hotkey came back, every time the mic dropped.
+        self.model = _LazyModel()
+        if not engine_stt.enabled():
+            self.model.load_in_background()
         from .config import hotkey_label
         _key_name = hotkey_label()
         print(f"[wispr] ready — hold {_key_name} to dictate "

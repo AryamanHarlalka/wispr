@@ -30,6 +30,8 @@ import os
 # point WISPR_HOME at a scratch dir.
 os.environ.setdefault("WISPR_HOTKEY", "right_option")
 os.environ.setdefault("WISPR_HOME", "/tmp/wispr-test-home")
+# The live voice engine (voiced) must not answer for the fake audio these tests feed in.
+os.environ.setdefault("WISPR_ENGINE_STT", "0")
 
 import sys           # noqa: E402
 import threading     # noqa: E402
